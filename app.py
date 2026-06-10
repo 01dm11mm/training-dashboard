@@ -10,6 +10,7 @@ Notion の「トレーニング記録」DB を読み書きする。
 
 import datetime as dt
 import os
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -103,6 +104,7 @@ def fetch_records(token: str) -> pd.DataFrame:
                     "実績ログ": _text(p.get("実績ログ")),
                     "達成": (p.get("達成", {}).get("select") or {}).get("name"),
                     "メモ": _text(p.get("メモ")),
+                    "順番": (p.get("順番", {}) or {}).get("number"),
                 }
             )
         if data.get("has_more"):
@@ -140,7 +142,7 @@ def update_record(token: str, page_id: str, *, weight=None, log=None,
 
 
 def create_record(token: str, *, week, split, exercise, goal="",
-                  goal_weight="", parts=None) -> None:
+                  goal_weight="", parts=None, order=None) -> None:
     """新しい行（種目）を作成する。来週メニューの取り込みに使う。"""
     props = {
         "種目": {"title": [{"text": {"content": exercise}}]},
@@ -153,11 +155,34 @@ def create_record(token: str, *, week, split, exercise, goal="",
         props["目標重量"] = {"rich_text": [{"text": {"content": goal_weight}}]}
     if parts:
         props["部位"] = {"multi_select": [{"name": p} for p in parts]}
+    if order is not None:
+        props["順番"] = {"number": order}
     resp = requests.post(
         f"{API}/pages", headers=_headers(token),
         json={"parent": {"database_id": DATABASE_ID}, "properties": props}, timeout=30,
     )
     resp.raise_for_status()
+
+
+def _apply_master(ex_id: str) -> None:
+    """マスター重量を、その種目の全セットの重量ボックスに反映する（on_change用）。"""
+    mv = st.session_state.get(f"m_{ex_id}", 0.0)
+    n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
+    for s in range(n):
+        st.session_state[f"w_{ex_id}_{s}"] = mv
+
+
+def parse_set_count(goal: str, default: int = 3) -> int:
+    """目標文字列からセット数を推定。例: '4×6-10'→4, '3×10'→3, '4セット'→4, '3周'→3。"""
+    if not goal:
+        return default
+    m = re.match(r"\s*(\d+)\s*[×xX✕*]", goal)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*(セット|周|set)", goal, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return default
 
 
 def build_summary(df: pd.DataFrame, week: int) -> str:
@@ -180,7 +205,7 @@ def build_summary(df: pd.DataFrame, week: int) -> str:
     lines.append("## メニューと実績")
     splits_here = [s for s in SPLITS if s in set(wk["分割"])] or sorted(set(wk["分割"].dropna()))
     for sp in splits_here:
-        sub = wk[wk["分割"] == sp]
+        sub = wk[wk["分割"] == sp].sort_values(["順番", "created"], na_position="last")
         if sub.empty:
             continue
         # 日付があれば添える
@@ -286,62 +311,81 @@ with tab_input:
     rec_date = c3.date_input("実施日", value=dt.date.today())
 
     target = df[(df["週num"] == week_sel) & (df["分割"] == split_sel)].copy()
-    target = target.reset_index(drop=True)
+    # 「順番」列があればそれ優先、無ければ追加順（created）で並べる
+    target = target.sort_values(["順番", "created"], na_position="last").reset_index(drop=True)
 
     if target.empty:
         st.info("この週・分割の行がありません。「📤 まとめ＆計画」から来週メニューを取り込めます。")
     else:
-        st.caption(f"W{week_sel} / {split_sel} … {len(target)} 種目。重量を入れて「保存」。空欄は触りません。")
-        with st.form("record_form"):
-            entries = []
-            for i, row in target.iterrows():
-                done_mark = "✅" if pd.notna(row["実績重量"]) else "・"
-                st.markdown(f"**{done_mark} {row['種目']}**　🎯{row['目標'] or '—'}　/　目標重量 {row['目標重量'] or '—'}")
-                ic1, ic2, ic3 = st.columns([1, 2, 1])
-                w = ic1.number_input(
-                    "重量", min_value=0.0, step=2.5,
-                    value=float(row["実績重量"]) if pd.notna(row["実績重量"]) else 0.0,
-                    key=f"w_{row['page_id']}",
-                )
-                reps = ic2.text_input(
-                    "回数（各セット・カンマ区切り 例: 10,10,9）", value="",
-                    key=f"r_{row['page_id']}",
-                )
-                ach_opts = ["（未入力）"] + ACHIEVE_OPTIONS
-                ach_idx = ach_opts.index(row["達成"]) if row["達成"] in ACHIEVE_OPTIONS else 0
-                ach = ic3.selectbox("達成", ach_opts, index=ach_idx, key=f"a_{row['page_id']}")
-                with st.expander("セットごとに重量を変えた時（任意）"):
-                    override = st.text_input(
-                        "セット別 例: 60×10, 62×8, 65×6",
-                        value="", key=f"o_{row['page_id']}", label_visibility="collapsed",
-                    )
-                if row["実績ログ"]:
-                    st.caption(f"既存ログ: {row['実績ログ']}（上書きしたい時だけ入力）")
-                entries.append((row["page_id"], w, reps, ach, override))
-                st.divider()
+        st.caption(
+            f"W{week_sel} / {split_sel} … {len(target)} 種目。"
+            "マスター重量を入れると全セットに一括反映。変えたいセットだけ後から個別に修正。"
+        )
+        for _, row in target.iterrows():
+            ex_id = row["page_id"]
+            n_default = parse_set_count(row["目標"])
+            # 初期値を session_state に入れておく（value= と key= の二重指定警告を避ける）
+            if f"n_{ex_id}" not in st.session_state:
+                st.session_state[f"n_{ex_id}"] = n_default
+            if f"a_{ex_id}" not in st.session_state:
+                st.session_state[f"a_{ex_id}"] = row["達成"] if row["達成"] in ACHIEVE_OPTIONS else "（未入力）"
 
-            submitted = st.form_submit_button("💾 保存", type="primary", use_container_width=True)
+            done_mark = "✅" if pd.notna(row["実績重量"]) else "・"
+            st.markdown(f"**{done_mark} {row['種目']}**　🎯{row['目標'] or '—'}　/　目標重量 {row['目標重量'] or '—'}")
 
-        if submitted:
+            mc1, mc2, mc3 = st.columns([1.2, 1, 1.2])
+            mc1.number_input(
+                "マスター重量", min_value=0.0, step=2.5, key=f"m_{ex_id}",
+                on_change=_apply_master, args=(ex_id,),
+                help="入れると下の全セットに一括反映。個別に変えたいセットだけ後で修正。",
+            )
+            mc2.number_input(
+                "セット数", min_value=1, max_value=12, step=1, key=f"n_{ex_id}",
+                on_change=_apply_master, args=(ex_id,),
+            )
+            mc3.selectbox("達成", ["（未入力）"] + ACHIEVE_OPTIONS, key=f"a_{ex_id}")
+
+            n = int(st.session_state.get(f"n_{ex_id}", n_default) or n_default)
+            for s in range(n):
+                sc1, sc2 = st.columns(2)
+                sc1.number_input(f"重量 set{s + 1}", min_value=0.0, step=2.5, key=f"w_{ex_id}_{s}")
+                sc2.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=f"r_{ex_id}_{s}")
+
+            if row["実績ログ"]:
+                st.caption(f"既存ログ: {row['実績ログ']}")
+            st.divider()
+
+        if st.button("💾 保存", type="primary", use_container_width=True):
             saved, errors = 0, []
-            for page_id, w, reps, ach, override in entries:
-                reps, override = reps.strip(), override.strip()
+            for _, row in target.iterrows():
+                ex_id = row["page_id"]
+                n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
+                ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
+                sets = []
+                for s in range(n):
+                    wv = float(st.session_state.get(f"w_{ex_id}_{s}", 0.0) or 0.0)
+                    rv = int(st.session_state.get(f"r_{ex_id}_{s}", 0) or 0)
+                    if wv > 0 or rv > 0:
+                        sets.append((wv, rv))
                 # 何も入力が無ければスキップ
-                if w == 0.0 and not reps and not override and ach == "（未入力）":
+                if not sets and ach == "（未入力）":
                     continue
-                # 実績ログの組み立て：例外（セット別重量）があれば優先
-                if override:
-                    log = override
-                elif w > 0 and reps:
-                    log = f"{w:g}×{reps}"
-                elif reps:
-                    log = reps
+                # ログ組み立て：重量が全セット同じなら「重量×回数,回数,…」、違えば「重量×回数, …」
+                weights = [wv for wv, rv in sets]
+                if not sets:
+                    log, top_weight = None, None
+                elif len(set(weights)) <= 1:
+                    wv = weights[0]
+                    reps_str = ",".join(str(rv) for _, rv in sets)
+                    log = f"{wv:g}×{reps_str}" if wv > 0 else reps_str
+                    top_weight = wv if wv > 0 else None
                 else:
-                    log = None
+                    log = ", ".join(f"{wv:g}×{rv}" for wv, rv in sets)
+                    top_weight = max(weights)
                 try:
                     update_record(
-                        token, page_id,
-                        weight=w if w > 0 else None,
+                        token, ex_id,
+                        weight=top_weight,
                         log=log,
                         achieve=None if ach == "（未入力）" else ach,
                         date=rec_date,
@@ -461,12 +505,15 @@ with tab_plan:
             st.warning(f"W{int(new_week)} は既に存在します。取り込むと種目が**追加**されます（重複に注意）。")
         if st.button(f"➕ W{int(new_week)} として {len(parsed)} 種目を作成", type="primary"):
             made, errors = 0, []
+            order_counter = {}  # 分割ごとに 1,2,3… と採番
             prog = st.progress(0.0)
             for i, m in enumerate(parsed):
+                order_counter[m["分割"]] = order_counter.get(m["分割"], 0) + 1
                 try:
                     create_record(
                         token, week=int(new_week), split=m["分割"], exercise=m["種目"],
                         goal=m["目標"], goal_weight=m["目標重量"], parts=m["部位"],
+                        order=order_counter[m["分割"]],
                     )
                     made += 1
                 except requests.HTTPError as e:
