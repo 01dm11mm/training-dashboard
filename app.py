@@ -303,28 +303,46 @@ with tab_input:
                     value=float(row["実績重量"]) if pd.notna(row["実績重量"]) else 0.0,
                     key=f"w_{row['page_id']}",
                 )
-                log = ic2.text_input(
-                    "ログ（例: 140 / 10,10,9）", value=row["実績ログ"] or "",
-                    key=f"l_{row['page_id']}",
+                reps = ic2.text_input(
+                    "回数（各セット・カンマ区切り 例: 10,10,9）", value="",
+                    key=f"r_{row['page_id']}",
                 )
                 ach_opts = ["（未入力）"] + ACHIEVE_OPTIONS
                 ach_idx = ach_opts.index(row["達成"]) if row["達成"] in ACHIEVE_OPTIONS else 0
                 ach = ic3.selectbox("達成", ach_opts, index=ach_idx, key=f"a_{row['page_id']}")
-                entries.append((row["page_id"], w, log, ach))
+                with st.expander("セットごとに重量を変えた時（任意）"):
+                    override = st.text_input(
+                        "セット別 例: 60×10, 62×8, 65×6",
+                        value="", key=f"o_{row['page_id']}", label_visibility="collapsed",
+                    )
+                if row["実績ログ"]:
+                    st.caption(f"既存ログ: {row['実績ログ']}（上書きしたい時だけ入力）")
+                entries.append((row["page_id"], w, reps, ach, override))
                 st.divider()
 
             submitted = st.form_submit_button("💾 保存", type="primary", use_container_width=True)
 
         if submitted:
             saved, errors = 0, []
-            for page_id, w, log, ach in entries:
-                if w == 0.0 and not log and ach == "（未入力）":
+            for page_id, w, reps, ach, override in entries:
+                reps, override = reps.strip(), override.strip()
+                # 何も入力が無ければスキップ
+                if w == 0.0 and not reps and not override and ach == "（未入力）":
                     continue
+                # 実績ログの組み立て：例外（セット別重量）があれば優先
+                if override:
+                    log = override
+                elif w > 0 and reps:
+                    log = f"{w:g}×{reps}"
+                elif reps:
+                    log = reps
+                else:
+                    log = None
                 try:
                     update_record(
                         token, page_id,
                         weight=w if w > 0 else None,
-                        log=log or None,
+                        log=log,
                         achieve=None if ach == "（未入力）" else ach,
                         date=rec_date,
                     )
