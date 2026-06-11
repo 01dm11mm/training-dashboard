@@ -264,6 +264,25 @@ def parse_menu(text: str):
 
 # --- 起動 ----------------------------------------------------------------
 st.set_page_config(page_title="トレーニング", page_icon="💪", layout="wide")
+
+# スマホでもセット入力の[重量|回数]を縦積みさせず横一行に保つ。
+# Streamlit は狭い画面だと st.columns を自動で縦積みするため、
+# セット行コンテナ(st-key-setrow…)内だけ nowrap を強制する。
+st.markdown(
+    """
+    <style>
+    div[class*="st-key-setrow"] div[data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap;
+        gap: 0.4rem;
+    }
+    div[class*="st-key-setrow"] div[data-testid="stColumn"] {
+        min-width: 0 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("💪 トレーニング")
 
 if not check_password():
@@ -347,9 +366,10 @@ with tab_input:
 
             n = int(st.session_state.get(f"n_{ex_id}", n_default) or n_default)
             for s in range(n):
-                sc1, sc2 = st.columns(2)
-                sc1.number_input(f"重量 set{s + 1}", min_value=0.0, step=2.5, key=f"w_{ex_id}_{s}")
-                sc2.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=f"r_{ex_id}_{s}")
+                with st.container(key=f"setrow_{ex_id}_{s}"):
+                    sc1, sc2 = st.columns(2)
+                    sc1.number_input(f"重量 set{s + 1}", min_value=0.0, step=2.5, key=f"w_{ex_id}_{s}")
+                    sc2.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=f"r_{ex_id}_{s}")
 
             if row["実績ログ"]:
                 st.caption(f"既存ログ: {row['実績ログ']}")
