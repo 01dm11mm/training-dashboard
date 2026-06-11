@@ -271,11 +271,15 @@ st.set_page_config(page_title="トレーニング", page_icon="💪", layout="wi
 st.markdown(
     """
     <style>
-    /* 柔らかい丸ゴシック系フォント（iOS/Mac標準。無ければ素直なサンセリフに） */
-    html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
-        font-family: "Hiragino Maru Gothic ProN", "ヒラギノ丸ゴ ProN W4",
+    /* 柔らかい丸ゴシックのWebフォントを読み込む（端末に無くても確実に適用される）。
+       iPhoneには丸ゴシックが標準で入っていないため、フォント名指定だけだと
+       角ゴにフォールバックして変化しない。@import で M PLUS Rounded 1c を取得。 */
+    @import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700&display=swap');
+    html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"],
+    button, input, textarea, select, .stMarkdown, [data-testid="stMarkdownContainer"] {
+        font-family: "M PLUS Rounded 1c", "Hiragino Maru Gothic ProN",
             "Hiragino Sans", "Yu Gothic", "Noto Sans JP",
-            system-ui, -apple-system, sans-serif;
+            system-ui, -apple-system, sans-serif !important;
     }
     /* 文字の行間を少しだけ詰める */
     .stApp, .stMarkdown, [data-testid="stMarkdownContainer"] {
