@@ -271,6 +271,22 @@ st.set_page_config(page_title="トレーニング", page_icon="💪", layout="wi
 st.markdown(
     """
     <style>
+    /* 柔らかい丸ゴシック系フォント（iOS/Mac標準。無ければ素直なサンセリフに） */
+    html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
+        font-family: "Hiragino Maru Gothic ProN", "ヒラギノ丸ゴ ProN W4",
+            "Hiragino Sans", "Yu Gothic", "Noto Sans JP",
+            system-ui, -apple-system, sans-serif;
+    }
+    /* 文字の行間を少しだけ詰める */
+    .stApp, .stMarkdown, [data-testid="stMarkdownContainer"] {
+        line-height: 1.45;
+    }
+    /* 要素どうしの縦の余白も少しだけ詰める */
+    [data-testid="stVerticalBlock"] {
+        gap: 0.6rem;
+    }
+
+    /* セット入力の[重量|回数]をスマホでも横一行に保つ */
     div[class*="st-key-setrow"] div[data-testid="stHorizontalBlock"] {
         flex-wrap: nowrap;
         gap: 0.4rem;
