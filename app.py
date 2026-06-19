@@ -9,6 +9,7 @@ Notion の「トレーニング記録」DB を読み書きする。
 """
 
 import datetime as dt
+import json
 import os
 import re
 
@@ -16,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from streamlit_local_storage import LocalStorage
 
 # --- 設定 ----------------------------------------------------------------
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "dc49803fa43a48868e54824072e2ffb1")
@@ -27,6 +29,9 @@ ACHIEVE_OPTIONS = ["✅達成", "△一部", "❌未達", "－スキップ"]
 PARTS_OPTIONS = ["胸", "背中", "肩", "脚", "腕", "腹", "体幹"]
 # 来週メニューの貼り付け形式
 MENU_FORMAT = "分割 | 種目 | 目標 | 目標重量 | 部位(任意,カンマ区切り)"
+DRAFT_KEY = "tl_draft"  # 入力中の下書きを端末(ブラウザ)に一時保存するキー
+# 下書きとして保存する session_state のキー接頭辞（重量/回数/マスター/セット数/達成）
+DRAFT_PREFIXES = ("w_", "r_", "m_", "n_", "a_")
 
 
 def _secret(key: str) -> str:
@@ -227,6 +232,25 @@ def build_log(sets, bw: bool):
     return ", ".join(f"{wv:g}×{rv}" for wv, rv in sets), max(weights)
 
 
+def serialize_draft() -> str:
+    """入力中の値（週/分割/実施日/体重/各セット）を JSON 文字列にする（端末への下書き用）。"""
+    d = {}
+    for k, v in st.session_state.items():
+        if k in ("week_sel", "split_sel", "bw_today") or k.startswith(DRAFT_PREFIXES):
+            d[k] = v
+    rd = st.session_state.get("rec_date")
+    if isinstance(rd, dt.date):
+        d["rec_date"] = rd.isoformat()
+    return json.dumps(d, default=str)
+
+
+def clear_input_state() -> None:
+    """入力欄（重量/回数/マスター/セット数/達成/体重）の session_state を消す。"""
+    for k in list(st.session_state.keys()):
+        if k.startswith(DRAFT_PREFIXES) or k == "bw_today":
+            del st.session_state[k]
+
+
 def parse_set_count(goal: str, default: int = 3) -> int:
     """目標文字列からセット数を推定。例: '4×6-10'→4, '3×10'→3, '4セット'→4, '3周'→3。"""
     if not goal:
@@ -396,15 +420,47 @@ tab_input, tab_graph, tab_plan = st.tabs(["✍️ 今日の記録", "📊 グラ
 with tab_input:
     st.subheader("今日の記録を入力")
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    ls = LocalStorage()
+
+    # --- 下書き復元：セッション開始時に1回だけ、端末に残った入力を画面へ戻す ---
+    # LocalStorage() は初回に全アイテムを同期ロードするので、最初の run で getItem が
+    # 確定値を返す。ここで必ず _draft_restored を立て、以降の run では復元しない
+    # （以降も復元すると、このセッションが保存した下書きを読み戻して入力を上書きしてしまう）。
+    if not st.session_state.get("_draft_restored"):
+        raw = ls.getItem(DRAFT_KEY)  # 端末に下書きがあれば JSON 文字列、無ければ None
+        st.session_state["_draft_restored"] = True
+        if raw:
+            try:
+                draft = json.loads(raw)
+            except Exception:
+                draft = None
+            if isinstance(draft, dict) and draft:
+                for k, v in draft.items():
+                    if k == "rec_date" and v:
+                        try:
+                            st.session_state["rec_date"] = dt.date.fromisoformat(v)
+                        except Exception:
+                            pass
+                    else:
+                        st.session_state[k] = v
+                st.toast("前回の未保存の入力を復元しました", icon="↩️")
+                st.rerun()
+
     weeks = sorted([int(w) for w in df["週num"].dropna().unique()])
-    week_sel = c1.selectbox(
-        "週", weeks, index=len(weeks) - 1 if weeks else 0,
-        format_func=lambda w: f"W{w}",
-    )
+    c1, c2, c3 = st.columns([1, 1, 1])
+    if "week_sel" not in st.session_state and weeks:
+        st.session_state["week_sel"] = weeks[-1]
+    week_sel = c1.selectbox("週", weeks, format_func=lambda w: f"W{w}", key="week_sel")
+
     splits_here = [s for s in SPLITS if s in set(df[df["週num"] == week_sel]["分割"])]
-    split_sel = c2.selectbox("分割（今日のメニュー）", splits_here or SPLITS)
-    rec_date = c3.date_input("実施日", value=dt.date.today())
+    split_opts = splits_here or SPLITS
+    if st.session_state.get("split_sel") not in split_opts:
+        st.session_state["split_sel"] = split_opts[0]
+    split_sel = c2.selectbox("分割（今日のメニュー）", split_opts, key="split_sel")
+
+    if "rec_date" not in st.session_state:
+        st.session_state["rec_date"] = dt.date.today()
+    rec_date = c3.date_input("実施日", key="rec_date")
 
     if has_bw_col:
         bw_col, _ = st.columns([1, 2])
@@ -431,21 +487,14 @@ with tab_input:
             bw = is_bodyweight(row)  # 自重種目なら重量欄を出さない
             n_default = parse_set_count(row["目標"])
             # 初期値を session_state に入れておく（value= と key= の二重指定警告を避ける）
-            # 重量・回数は None で初期化＝最初は空欄（0をいちいち消さなくてよい）
-            first_seen = f"n_{ex_id}" not in st.session_state
+            # 重量・回数は None で初期化＝最初は空欄（0をいちいち消さなくてよい）。
+            # 下書き復元で既に値が入っていれば、その値が優先される（not in で上書きしない）。
             if f"n_{ex_id}" not in st.session_state:
                 st.session_state[f"n_{ex_id}"] = n_default
             if f"a_{ex_id}" not in st.session_state:
                 st.session_state[f"a_{ex_id}"] = row["達成"] if row["達成"] in ACHIEVE_OPTIONS else "（未入力）"
             if not bw and f"m_{ex_id}" not in st.session_state:
                 st.session_state[f"m_{ex_id}"] = None
-            if first_seen:
-                # この種目の「初期状態」を自動保存スナップショットに記録（初回描画では保存しない）
-                snap0 = st.session_state.setdefault("_autosave_snap", {})
-                snap0[ex_id] = (
-                    st.session_state[f"n_{ex_id}"], st.session_state[f"a_{ex_id}"],
-                    (), st.session_state.get("bw_today"),
-                )
 
             done_mark = "✅" if pd.notna(row["実績重量"]) else "・"
             tag = "（自重）" if bw else f"目標重量 {row['目標重量'] or '—'}"
@@ -487,52 +536,60 @@ with tab_input:
 
         bw_today = st.session_state.get("bw_today") if has_bw_col else None
 
-        # --- 自動保存：入力が変わった種目をその場で Notion に保存（セッション切れ対策）---
-        # 入力欄を変えるたびに rerun が走るので、前回保存から変化した種目だけを都度書き込む。
-        # これでサーバーがリセットされても、入力済みの内容は Notion に残る。
-        snap = st.session_state.setdefault("_autosave_snap", {})
-        auto_saved, auto_err = 0, False
-        for _, row in target.iterrows():
-            ex_id = row["page_id"]
-            bw = is_bodyweight(row)
-            n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
-            ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
-            sets = collect_sets(ex_id, bw, n)
-            if not sets and ach == "（未入力）":
-                continue
-            state = (n, ach, tuple(sets), bw_today)
-            if snap.get(ex_id) == state:
-                continue  # 前回保存から変化なし
-            log, top_weight = build_log(sets, bw)
-            try:
-                update_record(
-                    token, ex_id, weight=top_weight, log=log,
-                    achieve=None if ach == "（未入力）" else ach,
-                    date=rec_date, bodyweight=bw_today,
-                )
-                snap[ex_id] = state
-                auto_saved += 1
-            except requests.HTTPError:
-                auto_err = True
-        # 体重だけ入力した日も、その日の代表行に残す
-        if bw_today is not None and auto_saved == 0 and not target.empty \
-                and st.session_state.get("_bw_snap") != (bw_today, rec_date):
-            try:
-                update_record(token, target.iloc[0]["page_id"],
-                              date=rec_date, bodyweight=bw_today)
-                st.session_state["_bw_snap"] = (bw_today, rec_date)
-            except requests.HTTPError:
-                auto_err = True
-        if auto_saved:
-            st.toast(f"自動保存しました（{auto_saved}件）", icon="💾")
-        if auto_err:
-            st.toast("自動保存に一部失敗。通信を確認してください。", icon="⚠️")
+        # --- 下書きを端末に保存：入力が変わるたびに localStorage へ（Notionには書かない）---
+        # サーバーが切れても、再ログイン時にこの下書きから画面を復元できる。
+        draft_json = serialize_draft()
+        if draft_json != st.session_state.get("_draft_last"):
+            ls.setItem(DRAFT_KEY, draft_json, key="tl_set_draft")
+            st.session_state["_draft_last"] = draft_json
 
-        st.caption("✅ 入力すると自動でNotionに保存されます（サーバーが切れても消えません）。")
+        st.caption(
+            "📝 入力は自動でこの端末に下書き保存され、サーバーが切れても再ログインで復元されます。"
+            "Notion に記録するには下の「保存」を押してください（押すまで記録はされません）。"
+        )
 
-        if st.button("🔄 保存内容をグラフ等に反映（再読込）", use_container_width=True):
+        b1, b2 = st.columns([2, 1])
+        if b1.button("💾 保存（Notionに記録）", type="primary", use_container_width=True):
+            saved, errors = 0, []
+            for _, row in target.iterrows():
+                ex_id = row["page_id"]
+                bw = is_bodyweight(row)
+                n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
+                ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
+                sets = collect_sets(ex_id, bw, n)
+                if not sets and ach == "（未入力）":
+                    continue
+                log, top_weight = build_log(sets, bw)
+                try:
+                    update_record(
+                        token, ex_id, weight=top_weight, log=log,
+                        achieve=None if ach == "（未入力）" else ach,
+                        date=rec_date, bodyweight=bw_today,
+                    )
+                    saved += 1
+                except requests.HTTPError as e:
+                    errors.append(str(e))
+            # 体重だけ入れて種目を保存しなかった場合も、その日の1行に体重を残す
+            if bw_today is not None and saved == 0 and not errors and not target.empty:
+                try:
+                    update_record(token, target.iloc[0]["page_id"],
+                                  date=rec_date, bodyweight=bw_today)
+                    saved += 1
+                except requests.HTTPError as e:
+                    errors.append(str(e))
             st.cache_data.clear()
-            st.success("最新の保存内容を読み込みました。")
+            if saved:
+                st.success(f"{saved} 件保存しました。")
+            if errors:
+                st.error("一部失敗: " + " / ".join(errors[:3]))
+            if not saved and not errors:
+                st.info("入力がありませんでした。")
+
+        if b2.button("🗑 入力をクリア", use_container_width=True,
+                     help="画面の入力と端末の下書きを消します（Notionの記録は消えません）。"):
+            clear_input_state()
+            ls.deleteItem(DRAFT_KEY, key="tl_del_draft")
+            st.session_state["_draft_last"] = None
             st.rerun()
 
 # =====================================================================
