@@ -200,6 +200,33 @@ def _apply_master(ex_id: str) -> None:
         st.session_state[f"w_{ex_id}_{s}"] = mv
 
 
+def collect_sets(ex_id: str, bw: bool, n: int):
+    """session_state から (重量, 回数) のセット一覧を作る。空セットは除く。"""
+    sets = []
+    for s in range(n):
+        wv = 0.0 if bw else float(st.session_state.get(f"w_{ex_id}_{s}") or 0.0)
+        rv = int(st.session_state.get(f"r_{ex_id}_{s}") or 0)
+        if wv > 0 or rv > 0:
+            sets.append((wv, rv))
+    return sets
+
+
+def build_log(sets, bw: bool):
+    """セット一覧から (実績ログ文字列, 実績重量) を作る。
+    自重種目は回数だけ記録し、実績重量＝合計回数（懸垂と同じ規約、推移グラフ用）。"""
+    if not sets:
+        return None, None
+    weights = [wv for wv, _ in sets]
+    if bw:
+        reps = [rv for _, rv in sets]
+        return ",".join(str(r) for r in reps) + "回", float(sum(reps))
+    if len(set(weights)) <= 1:
+        wv = weights[0]
+        reps_str = ",".join(str(rv) for _, rv in sets)
+        return (f"{wv:g}×{reps_str}" if wv > 0 else reps_str), (wv if wv > 0 else None)
+    return ", ".join(f"{wv:g}×{rv}" for wv, rv in sets), max(weights)
+
+
 def parse_set_count(goal: str, default: int = 3) -> int:
     """目標文字列からセット数を推定。例: '4×6-10'→4, '3×10'→3, '4セット'→4, '3周'→3。"""
     if not goal:
@@ -405,12 +432,20 @@ with tab_input:
             n_default = parse_set_count(row["目標"])
             # 初期値を session_state に入れておく（value= と key= の二重指定警告を避ける）
             # 重量・回数は None で初期化＝最初は空欄（0をいちいち消さなくてよい）
+            first_seen = f"n_{ex_id}" not in st.session_state
             if f"n_{ex_id}" not in st.session_state:
                 st.session_state[f"n_{ex_id}"] = n_default
             if f"a_{ex_id}" not in st.session_state:
                 st.session_state[f"a_{ex_id}"] = row["達成"] if row["達成"] in ACHIEVE_OPTIONS else "（未入力）"
             if not bw and f"m_{ex_id}" not in st.session_state:
                 st.session_state[f"m_{ex_id}"] = None
+            if first_seen:
+                # この種目の「初期状態」を自動保存スナップショットに記録（初回描画では保存しない）
+                snap0 = st.session_state.setdefault("_autosave_snap", {})
+                snap0[ex_id] = (
+                    st.session_state[f"n_{ex_id}"], st.session_state[f"a_{ex_id}"],
+                    (), st.session_state.get("bw_today"),
+                )
 
             done_mark = "✅" if pd.notna(row["実績重量"]) else "・"
             tag = "（自重）" if bw else f"目標重量 {row['目標重量'] or '—'}"
@@ -450,67 +485,55 @@ with tab_input:
                 st.caption(f"既存ログ: {row['実績ログ']}")
             st.divider()
 
-        if st.button("💾 保存", type="primary", use_container_width=True):
-            saved, errors = 0, []
-            bw_today = st.session_state.get("bw_today") if has_bw_col else None
-            for _, row in target.iterrows():
-                ex_id = row["page_id"]
-                bw = is_bodyweight(row)
-                n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
-                ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
-                sets = []
-                for s in range(n):
-                    wv = 0.0 if bw else float(st.session_state.get(f"w_{ex_id}_{s}") or 0.0)
-                    rv = int(st.session_state.get(f"r_{ex_id}_{s}") or 0)
-                    if wv > 0 or rv > 0:
-                        sets.append((wv, rv))
-                # 何も入力が無ければスキップ
-                if not sets and ach == "（未入力）":
-                    continue
-                weights = [wv for wv, rv in sets]
-                if not sets:
-                    log, top_weight = None, None
-                elif bw:
-                    # 自重種目：回数だけ記録。実績重量には合計回数を入れる（懸垂と同じ規約、推移グラフ用）
-                    reps = [rv for _, rv in sets]
-                    log = ",".join(str(r) for r in reps) + "回"
-                    top_weight = float(sum(reps))
-                elif len(set(weights)) <= 1:
-                    # 重量が全セット同じなら「重量×回数,回数,…」
-                    wv = weights[0]
-                    reps_str = ",".join(str(rv) for _, rv in sets)
-                    log = f"{wv:g}×{reps_str}" if wv > 0 else reps_str
-                    top_weight = wv if wv > 0 else None
-                else:
-                    log = ", ".join(f"{wv:g}×{rv}" for wv, rv in sets)
-                    top_weight = max(weights)
-                try:
-                    update_record(
-                        token, ex_id,
-                        weight=top_weight,
-                        log=log,
-                        achieve=None if ach == "（未入力）" else ach,
-                        date=rec_date,
-                        bodyweight=bw_today,
-                    )
-                    saved += 1
-                except requests.HTTPError as e:
-                    errors.append(str(e))
-            # 体重だけ入れて種目を保存しなかった場合も、その日の1行に体重を残す
-            if bw_today is not None and saved == 0 and not errors and not target.empty:
-                try:
-                    update_record(token, target.iloc[0]["page_id"],
-                                  date=rec_date, bodyweight=bw_today)
-                    saved += 1
-                except requests.HTTPError as e:
-                    errors.append(str(e))
+        bw_today = st.session_state.get("bw_today") if has_bw_col else None
+
+        # --- 自動保存：入力が変わった種目をその場で Notion に保存（セッション切れ対策）---
+        # 入力欄を変えるたびに rerun が走るので、前回保存から変化した種目だけを都度書き込む。
+        # これでサーバーがリセットされても、入力済みの内容は Notion に残る。
+        snap = st.session_state.setdefault("_autosave_snap", {})
+        auto_saved, auto_err = 0, False
+        for _, row in target.iterrows():
+            ex_id = row["page_id"]
+            bw = is_bodyweight(row)
+            n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
+            ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
+            sets = collect_sets(ex_id, bw, n)
+            if not sets and ach == "（未入力）":
+                continue
+            state = (n, ach, tuple(sets), bw_today)
+            if snap.get(ex_id) == state:
+                continue  # 前回保存から変化なし
+            log, top_weight = build_log(sets, bw)
+            try:
+                update_record(
+                    token, ex_id, weight=top_weight, log=log,
+                    achieve=None if ach == "（未入力）" else ach,
+                    date=rec_date, bodyweight=bw_today,
+                )
+                snap[ex_id] = state
+                auto_saved += 1
+            except requests.HTTPError:
+                auto_err = True
+        # 体重だけ入力した日も、その日の代表行に残す
+        if bw_today is not None and auto_saved == 0 and not target.empty \
+                and st.session_state.get("_bw_snap") != (bw_today, rec_date):
+            try:
+                update_record(token, target.iloc[0]["page_id"],
+                              date=rec_date, bodyweight=bw_today)
+                st.session_state["_bw_snap"] = (bw_today, rec_date)
+            except requests.HTTPError:
+                auto_err = True
+        if auto_saved:
+            st.toast(f"自動保存しました（{auto_saved}件）", icon="💾")
+        if auto_err:
+            st.toast("自動保存に一部失敗。通信を確認してください。", icon="⚠️")
+
+        st.caption("✅ 入力すると自動でNotionに保存されます（サーバーが切れても消えません）。")
+
+        if st.button("🔄 保存内容をグラフ等に反映（再読込）", use_container_width=True):
             st.cache_data.clear()
-            if saved:
-                st.success(f"{saved} 件保存しました。")
-            if errors:
-                st.error("一部失敗: " + " / ".join(errors[:3]))
-            if not saved and not errors:
-                st.info("入力がありませんでした。")
+            st.success("最新の保存内容を読み込みました。")
+            st.rerun()
 
 # =====================================================================
 # 📊 グラフ
