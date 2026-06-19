@@ -78,9 +78,10 @@ def _text(prop) -> str:
     return "".join(a.get("plain_text", "") for a in arr)
 
 
-@st.cache_data(ttl=300, show_spinner="Notion から取得中…")
+@st.cache_data(ttl=1800, show_spinner="Notion から取得中…")
 def fetch_records(token: str) -> pd.DataFrame:
-    """Notion DB を全ページ取得して DataFrame にする（5分キャッシュ）。page_id 付き。"""
+    """Notion DB を全ページ取得して DataFrame にする（30分キャッシュ）。page_id 付き。
+    入力中に勝手に再取得されて体感がリセットされるのを防ぐため長めにする。"""
     url = f"{API}/databases/{DATABASE_ID}/query"
     rows, payload = [], {"page_size": 100}
     while True:
@@ -105,6 +106,7 @@ def fetch_records(token: str) -> pd.DataFrame:
                     "達成": (p.get("達成", {}).get("select") or {}).get("name"),
                     "メモ": _text(p.get("メモ")),
                     "順番": (p.get("順番", {}) or {}).get("number"),
+                    "体重": (p.get("体重", {}) or {}).get("number"),
                 }
             )
         if data.get("has_more"):
@@ -119,7 +121,7 @@ def fetch_records(token: str) -> pd.DataFrame:
 
 
 def update_record(token: str, page_id: str, *, weight=None, log=None,
-                  achieve=None, date=None, memo=None) -> None:
+                  achieve=None, date=None, memo=None, bodyweight=None) -> None:
     """1行の実績を Notion に書き込む。None の項目は触らない。"""
     props = {}
     if weight is not None:
@@ -132,6 +134,8 @@ def update_record(token: str, page_id: str, *, weight=None, log=None,
         props["日付"] = {"date": {"start": date.isoformat()}}
     if memo is not None and memo != "":
         props["メモ"] = {"rich_text": [{"text": {"content": memo}}]}
+    if bodyweight is not None:
+        props["体重"] = {"number": float(bodyweight)}
     if not props:
         return
     resp = requests.patch(
@@ -162,6 +166,30 @@ def create_record(token: str, *, week, split, exercise, goal="",
         json={"parent": {"database_id": DATABASE_ID}, "properties": props}, timeout=30,
     )
     resp.raise_for_status()
+
+
+def is_bodyweight(row) -> bool:
+    """目標重量に数字が無い種目（自重・時間系）は重量入力を出さない。
+    例: '自重' / 空欄 / '60秒' → True、'22.5lb(+0)' → False。"""
+    return not re.search(r"\d", str(row.get("目標重量") or ""))
+
+
+def ensure_bodyweight_column(token: str) -> bool:
+    """DB に number 型の「体重」列を用意する（無ければ作る）。一度だけ試行。
+    作成/既存なら True、権限不足等で失敗したら False（体重機能は静かに無効化）。"""
+    if "_has_bw_col" in st.session_state:
+        return st.session_state["_has_bw_col"]
+    ok = False
+    try:
+        r = requests.patch(
+            f"{API}/databases/{DATABASE_ID}", headers=_headers(token),
+            json={"properties": {"体重": {"number": {}}}}, timeout=30,
+        )
+        ok = r.status_code == 200
+    except Exception:
+        ok = False
+    st.session_state["_has_bw_col"] = ok
+    return ok
 
 
 def _apply_master(ex_id: str) -> None:
@@ -316,6 +344,8 @@ if not token:
     )
     st.stop()
 
+has_bw_col = ensure_bodyweight_column(token)
+
 if st.button("🔄 最新に更新"):
     st.cache_data.clear()
 
@@ -349,6 +379,15 @@ with tab_input:
     split_sel = c2.selectbox("分割（今日のメニュー）", splits_here or SPLITS)
     rec_date = c3.date_input("実施日", value=dt.date.today())
 
+    if has_bw_col:
+        bw_col, _ = st.columns([1, 2])
+        if "bw_today" not in st.session_state:
+            st.session_state["bw_today"] = None
+        bw_col.number_input(
+            "体重 (kg)", min_value=0.0, step=0.1, key="bw_today",
+            help="その日の体重。保存するとこの日の記録に紐づき、グラフの体重推移に出ます。",
+        )
+
     target = df[(df["週num"] == week_sel) & (df["分割"] == split_sel)].copy()
     # 「順番」列があればそれ優先、無ければ追加順（created）で並べる
     target = target.sort_values(["順番", "created"], na_position="last").reset_index(drop=True)
@@ -362,22 +401,30 @@ with tab_input:
         )
         for _, row in target.iterrows():
             ex_id = row["page_id"]
+            bw = is_bodyweight(row)  # 自重種目なら重量欄を出さない
             n_default = parse_set_count(row["目標"])
             # 初期値を session_state に入れておく（value= と key= の二重指定警告を避ける）
+            # 重量・回数は None で初期化＝最初は空欄（0をいちいち消さなくてよい）
             if f"n_{ex_id}" not in st.session_state:
                 st.session_state[f"n_{ex_id}"] = n_default
             if f"a_{ex_id}" not in st.session_state:
                 st.session_state[f"a_{ex_id}"] = row["達成"] if row["達成"] in ACHIEVE_OPTIONS else "（未入力）"
+            if not bw and f"m_{ex_id}" not in st.session_state:
+                st.session_state[f"m_{ex_id}"] = None
 
             done_mark = "✅" if pd.notna(row["実績重量"]) else "・"
-            st.markdown(f"**{done_mark} {row['種目']}**　🎯{row['目標'] or '—'}　/　目標重量 {row['目標重量'] or '—'}")
+            tag = "（自重）" if bw else f"目標重量 {row['目標重量'] or '—'}"
+            st.markdown(f"**{done_mark} {row['種目']}**　🎯{row['目標'] or '—'}　/　{tag}")
 
-            mc1, mc2, mc3 = st.columns([1.2, 1, 1.2])
-            mc1.number_input(
-                "マスター重量", min_value=0.0, step=2.5, key=f"m_{ex_id}",
-                on_change=_apply_master, args=(ex_id,),
-                help="入れると下の全セットに一括反映。個別に変えたいセットだけ後で修正。",
-            )
+            if bw:
+                mc2, mc3 = st.columns([1, 1.2])
+            else:
+                mc1, mc2, mc3 = st.columns([1.2, 1, 1.2])
+                mc1.number_input(
+                    "マスター重量", min_value=0.0, step=2.5, key=f"m_{ex_id}",
+                    on_change=_apply_master, args=(ex_id,),
+                    help="入れると下の全セットに一括反映。個別に変えたいセットだけ後で修正。",
+                )
             mc2.number_input(
                 "セット数", min_value=1, max_value=12, step=1, key=f"n_{ex_id}",
                 on_change=_apply_master, args=(ex_id,),
@@ -386,10 +433,18 @@ with tab_input:
 
             n = int(st.session_state.get(f"n_{ex_id}", n_default) or n_default)
             for s in range(n):
+                rkey, wkey = f"r_{ex_id}_{s}", f"w_{ex_id}_{s}"
+                if rkey not in st.session_state:
+                    st.session_state[rkey] = None
+                if not bw and wkey not in st.session_state:
+                    st.session_state[wkey] = None
                 with st.container(key=f"setrow_{ex_id}_{s}"):
-                    sc1, sc2 = st.columns(2)
-                    sc1.number_input(f"重量 set{s + 1}", min_value=0.0, step=2.5, key=f"w_{ex_id}_{s}")
-                    sc2.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=f"r_{ex_id}_{s}")
+                    if bw:
+                        st.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=rkey)
+                    else:
+                        sc1, sc2 = st.columns(2)
+                        sc1.number_input(f"重量 set{s + 1}", min_value=0.0, step=2.5, key=wkey)
+                        sc2.number_input(f"回数 set{s + 1}", min_value=0, step=1, key=rkey)
 
             if row["実績ログ"]:
                 st.caption(f"既存ログ: {row['実績ログ']}")
@@ -397,24 +452,31 @@ with tab_input:
 
         if st.button("💾 保存", type="primary", use_container_width=True):
             saved, errors = 0, []
+            bw_today = st.session_state.get("bw_today") if has_bw_col else None
             for _, row in target.iterrows():
                 ex_id = row["page_id"]
+                bw = is_bodyweight(row)
                 n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
                 ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
                 sets = []
                 for s in range(n):
-                    wv = float(st.session_state.get(f"w_{ex_id}_{s}", 0.0) or 0.0)
-                    rv = int(st.session_state.get(f"r_{ex_id}_{s}", 0) or 0)
+                    wv = 0.0 if bw else float(st.session_state.get(f"w_{ex_id}_{s}") or 0.0)
+                    rv = int(st.session_state.get(f"r_{ex_id}_{s}") or 0)
                     if wv > 0 or rv > 0:
                         sets.append((wv, rv))
                 # 何も入力が無ければスキップ
                 if not sets and ach == "（未入力）":
                     continue
-                # ログ組み立て：重量が全セット同じなら「重量×回数,回数,…」、違えば「重量×回数, …」
                 weights = [wv for wv, rv in sets]
                 if not sets:
                     log, top_weight = None, None
+                elif bw:
+                    # 自重種目：回数だけ記録。実績重量には合計回数を入れる（懸垂と同じ規約、推移グラフ用）
+                    reps = [rv for _, rv in sets]
+                    log = ",".join(str(r) for r in reps) + "回"
+                    top_weight = float(sum(reps))
                 elif len(set(weights)) <= 1:
+                    # 重量が全セット同じなら「重量×回数,回数,…」
                     wv = weights[0]
                     reps_str = ",".join(str(rv) for _, rv in sets)
                     log = f"{wv:g}×{reps_str}" if wv > 0 else reps_str
@@ -429,7 +491,16 @@ with tab_input:
                         log=log,
                         achieve=None if ach == "（未入力）" else ach,
                         date=rec_date,
+                        bodyweight=bw_today,
                     )
+                    saved += 1
+                except requests.HTTPError as e:
+                    errors.append(str(e))
+            # 体重だけ入れて種目を保存しなかった場合も、その日の1行に体重を残す
+            if bw_today is not None and saved == 0 and not errors and not target.empty:
+                try:
+                    update_record(token, target.iloc[0]["page_id"],
+                                  date=rec_date, bodyweight=bw_today)
                     saved += 1
                 except requests.HTTPError as e:
                     errors.append(str(e))
@@ -500,6 +571,17 @@ with tab_graph:
                 fig2 = px.pie(counts, names="達成", values="件数", hole=0.5)
                 fig2.update_layout(height=360)
                 st.plotly_chart(fig2, use_container_width=True)
+
+    if "体重" in df.columns and df["体重"].notna().any():
+        st.divider()
+        st.subheader("⚖️ 体重の推移")
+        bwdf = df.dropna(subset=["体重", "日付"]).copy()
+        # 1日1値（同じ日に複数行に体重が付いていても代表値1つにまとめる）
+        bwdf = bwdf.groupby("日付", as_index=False)["体重"].max().sort_values("日付")
+        figw = px.line(bwdf, x="日付", y="体重", markers=True,
+                       labels={"日付": "日付", "体重": "体重 (kg)"})
+        figw.update_layout(height=320)
+        st.plotly_chart(figw, use_container_width=True)
 
     st.divider()
     if latest_week is not None:
