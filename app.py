@@ -220,11 +220,30 @@ def is_bodyweight(row) -> bool:
 def parse_target_weight(text) -> float | None:
     """目標重量の文字列から目標の数値だけ取り出す。
     例: '22.5lb(+0)'→22.5、'15lb(維持)'→15、'自重'/空欄→None。
-    先頭の数値を目標重量とみなす（末尾の (+0) 等の増減メモは無視）。"""
+    『合計30回』のように合計回数が書かれていれば、その回数を目標とする
+    （懸垂など加重メモが先に来る種目で、先頭の加重kgを誤って拾わないため）。"""
     if not text:
         return None
-    m = re.search(r"\d+(?:\.\d+)?", str(text))
+    s = str(text)
+    m = re.search(r"合計\s*(\d+(?:\.\d+)?)\s*回", s)  # 「合計30回」→30（総回数が目標）
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\d+(?:\.\d+)?", s)
     return float(m.group()) if m else None
+
+
+def is_weight_goal(goal_weight) -> bool:
+    """目標重量が『重量（lb/kg）の目標』かどうか。現在地グラフの対象を絞るのに使う。
+    '25lb'/'加重5kg…合計30回'→True、'4周'/'自重20回'（純自重・サーキット）→False。"""
+    s = str(goal_weight or "")
+    if not s.strip():
+        return False
+    if "周" in s:  # サーキット系（例: '4周'）は重量比較の対象外
+        return False
+    has_unit = bool(re.search(r"(lb|kg)", s, re.IGNORECASE))
+    if "自重" in s and not has_unit:  # 加重もない純粋な自重は重量目標でない
+        return False
+    return parse_target_weight(s) is not None
 
 
 def ensure_bodyweight_column(token: str) -> bool:
@@ -680,56 +699,67 @@ with tab_graph:
         latest_rec = done.sort_values(["週num", "日付"]).groupby("種目").tail(1)
         latest_map = dict(zip(latest_rec["種目"], latest_rec["実績重量"]))
         for _, r in goal_src.iterrows():
+            if not is_weight_goal(r["目標重量"]):
+                continue  # 自重・サーキット系（周/自重）は重量の現在地に出さない
             target = parse_target_weight(r["目標重量"])
-            if not target or target <= 0:
-                continue  # 自重・時間系など目標が数値でない種目は対象外
             ex = r["種目"]
             bv = best.get(ex)
-            bv = float(bv) if pd.notna(bv) else None
+            if pd.isna(bv):
+                continue  # 実績がまだ無い種目は位置を出せないので非表示
+            bv = float(bv)
             lv = latest_map.get(ex)
             lv = float(lv) if pd.notna(lv) else None
             rows.append({
-                "種目": ex,
-                "目標": target,
-                "ベスト": bv, "ベスト率": (bv / target * 100) if bv is not None else 0.0,
-                "直近": lv, "直近率": (lv / target * 100) if lv is not None else 0.0,
+                "種目": ex, "目標": target,
+                "ベスト": bv, "ベスト率": bv / target * 100,
+                "直近": lv, "直近率": (lv / target * 100) if lv is not None else None,
             })
 
     if rows:
-        gdf = pd.DataFrame(rows).sort_values("ベスト率")
-
-        def _lbl(kg, pct):
-            return "" if kg is None else f"{kg:g}（{pct:.0f}%）"
-
+        # 達成率の低い順（伸びしろ順）に並べる。上ほど目標に近い。
+        gdf = pd.DataFrame(rows).sort_values("ベスト率").reset_index(drop=True)
         figg = go.Figure()
-        # ベスト（自己最高）を上段の棒に。直近（今の調子）を下段の棒に。
-        figg.add_trace(go.Bar(
-            y=gdf["種目"], x=gdf["ベスト率"], orientation="h", name="ベスト",
-            marker_color="#2ca02c",
-            text=[_lbl(k, p) for k, p in zip(gdf["ベスト"], gdf["ベスト率"])],
-            textposition="outside", cliponaxis=False, hoverinfo="skip",
+        # 直近→ベストをつなぐ細い線（両者の差＝伸び幅が一目でわかる）
+        for _, g in gdf.iterrows():
+            x0 = g["直近率"] if g["直近率"] is not None else g["ベスト率"]
+            figg.add_trace(go.Scatter(
+                x=[x0, g["ベスト率"]], y=[g["種目"], g["種目"]],
+                mode="lines", line=dict(color="#e2e4ea", width=4),
+                showlegend=False, hoverinfo="skip",
+            ))
+        # 🔵直近（今の調子）
+        figg.add_trace(go.Scatter(
+            x=gdf["直近率"], y=gdf["種目"], mode="markers", name="直近",
+            marker=dict(color="#4c78d8", size=12, line=dict(color="white", width=1.5)),
+            customdata=gdf["直近"],
+            hovertemplate="直近 %{customdata:g}（%{x:.0f}%）<extra></extra>",
         ))
-        figg.add_trace(go.Bar(
-            y=gdf["種目"], x=gdf["直近率"], orientation="h", name="直近",
-            marker_color="#4c78d8",
-            text=[_lbl(k, p) for k, p in zip(gdf["直近"], gdf["直近率"])],
-            textposition="outside", cliponaxis=False, hoverinfo="skip",
+        # 🟢ベスト（自己最高）＋数値ラベル
+        figg.add_trace(go.Scatter(
+            x=gdf["ベスト率"], y=gdf["種目"], mode="markers+text", name="ベスト",
+            marker=dict(color="#2ca02c", size=12, line=dict(color="white", width=1.5)),
+            text=[f"{b:g}" for b in gdf["ベスト"]], textposition="middle right",
+            textfont=dict(size=11, color="#2e7d32"),
+            customdata=gdf["ベスト"],
+            hovertemplate="ベスト %{customdata:g}（%{x:.0f}%）<extra></extra>",
         ))
-        figg.add_vline(
-            x=100, line_dash="dash", line_color="#d62728",
-            annotation_text="目標", annotation_position="top",
-        )
+        figg.add_vline(x=100, line_dash="dash", line_color="#d62728",
+                       annotation_text="目標", annotation_position="top right")
+        xmax = max(115, gdf["ベスト率"].max() * 1.12)
         figg.update_layout(
-            barmode="group", height=max(280, 62 * len(gdf) + 100),
+            height=max(320, 26 * len(gdf) + 120),
             xaxis_title="目標達成率 (%)",
-            xaxis_range=[0, max(115, gdf[["ベスト率", "直近率"]].max().max() * 1.15)],
+            xaxis=dict(range=[0, xmax], gridcolor="#f0f1f4", zeroline=False),
+            yaxis=dict(automargin=True),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=10, r=40, t=40, b=10),
+            margin=dict(l=6, r=48, t=40, b=10),
+            plot_bgcolor="white",
         )
         st.plotly_chart(figg, use_container_width=True)
         st.caption(
-            f"{src_note}に対して、各種目の重量が何%まで来ているか。"
-            "🟢ベスト＝自己最高 / 🔵直近＝いちばん最近の記録。赤い点線（100%）が目標。"
+            f"{src_note}に対する各種目の位置。🟢ベスト＝自己最高／🔵直近＝最新記録、"
+            "つなぐ線が両者の差。赤い点線（100%）が目標、数字はベスト重量。"
+            "自重・サーキット種目は重量比較に向かないため除外しています。"
         )
     else:
         st.info("目標重量が数値の実績がまだありません。"
