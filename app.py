@@ -665,13 +665,38 @@ with tab_input:
 with tab_graph:
     done = df.dropna(subset=["実績重量"]).copy()
 
+    # 目標(3ヶ月後/今週)に対する達成率：各種目のベスト÷目標の平均（100%上限）。
+    _grows = df[df["週"] == GOAL_WEEK]
+    if not _grows.empty:
+        _gsrc = _grows[["種目", "目標重量"]].drop_duplicates("種目", keep="last")
+    elif latest_week is not None:
+        _gsrc = df[df["週num"] == latest_week][["種目", "目標重量"]].drop_duplicates("種目", keep="last")
+    else:
+        _gsrc = pd.DataFrame(columns=["種目", "目標重量"])
+    _best = done.groupby("種目")["実績重量"].max() if not done.empty else pd.Series(dtype=float)
+    _ratios, _reached = [], 0
+    for _, _r in _gsrc.iterrows():
+        if not is_weight_goal(_r["目標重量"]):
+            continue
+        _t = parse_target_weight(_r["目標重量"])
+        _b = _best.get(_r["種目"])
+        if pd.isna(_b):
+            continue
+        _ratio = float(_b) / _t
+        _ratios.append(min(_ratio, 1.0))
+        if _ratio >= 1:
+            _reached += 1
+    goal_rate = sum(_ratios) / len(_ratios) * 100 if _ratios else None
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("記録セット数", f"{len(done)}")
     c2.metric("種目数", f"{done['種目'].nunique()}")
     c3.metric("記録週数", f"{int(done['週num'].nunique())}" if done['週num'].notna().any() else "0")
-    graded = df["達成"].notna().sum()
-    achieved = (df["達成"] == "✅達成").sum()
-    c4.metric("達成率", f"{achieved / graded * 100:.0f}%" if graded else "—")
+    c4.metric(
+        "目標達成率", f"{goal_rate:.0f}%" if goal_rate is not None else "—",
+        help=(f"各種目のベスト÷目標の平均（100%上限）。目標到達 {_reached}/{len(_ratios)} 種目。"
+              if _ratios else "目標重量が数値の種目がまだありません。"),
+    )
 
     st.divider()
 
