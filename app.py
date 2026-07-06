@@ -718,47 +718,32 @@ with tab_graph:
     if rows:
         # 達成率の低い順（伸びしろ順）に並べる。上ほど目標に近い。
         gdf = pd.DataFrame(rows).sort_values("ベスト率").reset_index(drop=True)
-        figg = go.Figure()
-        # 直近→ベストをつなぐ細い線（両者の差＝伸び幅が一目でわかる）
-        for _, g in gdf.iterrows():
-            x0 = g["直近率"] if g["直近率"] is not None else g["ベスト率"]
-            figg.add_trace(go.Scatter(
-                x=[x0, g["ベスト率"]], y=[g["種目"], g["種目"]],
-                mode="lines", line=dict(color="#e2e4ea", width=4),
-                showlegend=False, hoverinfo="skip",
-            ))
-        # 🔵直近（今の調子）
-        figg.add_trace(go.Scatter(
-            x=gdf["直近率"], y=gdf["種目"], mode="markers", name="直近",
-            marker=dict(color="#4c78d8", size=12, line=dict(color="white", width=1.5)),
-            customdata=gdf["直近"],
-            hovertemplate="直近 %{customdata:g}（%{x:.0f}%）<extra></extra>",
-        ))
-        # 🟢ベスト（自己最高）＋数値ラベル
-        figg.add_trace(go.Scatter(
-            x=gdf["ベスト率"], y=gdf["種目"], mode="markers+text", name="ベスト",
-            marker=dict(color="#2ca02c", size=12, line=dict(color="white", width=1.5)),
-            text=[f"{b:g}" for b in gdf["ベスト"]], textposition="middle right",
-            textfont=dict(size=11, color="#2e7d32"),
-            customdata=gdf["ベスト"],
-            hovertemplate="ベスト %{customdata:g}（%{x:.0f}%）<extra></extra>",
+        colors = ["#2ca02c" if p >= 100 else "#4c78d8" for p in gdf["ベスト率"]]
+        labels = [f"{b:g} / {t:g}（{p:.0f}%）"
+                  for b, t, p in zip(gdf["ベスト"], gdf["目標"], gdf["ベスト率"])]
+        # ホバー用に 直近 を渡す（棒はベスト基準、直近はタップで確認）
+        cd = [[f"{b:g}", (f"{lv:g}" if lv is not None else "—"), f"{t:g}"]
+              for b, lv, t in zip(gdf["ベスト"], gdf["直近"], gdf["目標"])]
+        figg = go.Figure(go.Bar(
+            y=gdf["種目"], x=gdf["ベスト率"], orientation="h",
+            marker_color=colors, text=labels, textposition="outside",
+            cliponaxis=False, customdata=cd,
+            hovertemplate=("ベスト %{customdata[0]} / 直近 %{customdata[1]} / "
+                           "目標 %{customdata[2]}（%{x:.0f}%）<extra>%{y}</extra>"),
         ))
         figg.add_vline(x=100, line_dash="dash", line_color="#d62728",
-                       annotation_text="目標", annotation_position="top right")
-        xmax = max(115, gdf["ベスト率"].max() * 1.12)
+                       annotation_text="目標", annotation_position="top")
         figg.update_layout(
-            height=max(320, 26 * len(gdf) + 120),
+            height=max(240, 46 * len(gdf) + 90),
             xaxis_title="目標達成率 (%)",
-            xaxis=dict(range=[0, xmax], gridcolor="#f0f1f4", zeroline=False),
+            xaxis_range=[0, max(115, gdf["ベスト率"].max() * 1.12)],
             yaxis=dict(automargin=True),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=6, r=48, t=40, b=10),
-            plot_bgcolor="white",
+            margin=dict(l=6, r=40, t=30, b=10),
         )
         st.plotly_chart(figg, use_container_width=True)
         st.caption(
-            f"{src_note}に対する各種目の位置。🟢ベスト＝自己最高／🔵直近＝最新記録、"
-            "つなぐ線が両者の差。赤い点線（100%）が目標、数字はベスト重量。"
+            f"{src_note}に対して、各種目の自己ベストが目標重量の何%まで来ているか。"
+            "赤い点線（100%）が目標。緑＝達成／青＝途中。棒をタップすると直近の記録も出ます。"
             "自重・サーキット種目は重量比較に向かないため除外しています。"
         )
     else:
