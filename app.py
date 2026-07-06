@@ -15,6 +15,7 @@ import re
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from streamlit_local_storage import LocalStorage
@@ -32,6 +33,11 @@ MENU_FORMAT = "分割 | 種目 | 目標 | 目標重量 | 部位(任意,カンマ
 DRAFT_KEY = "tl_draft"  # 入力中の下書きを端末(ブラウザ)に一時保存するキー
 # 下書きとして保存する session_state のキー接頭辞（重量/回数/マスター/セット数/達成）
 DRAFT_PREFIXES = ("w_", "r_", "m_", "n_", "a_")
+# 最終目標(3ヶ月後)を持たせるセンチネル行の週。通常の週(数値)と分けるための固定値。
+# 週num が数値にならないので、週次のビュー(入力/まとめ/推移)には一切出てこない。
+GOAL_WEEK = "目標"
+# 最終目標の貼り付け形式（Claudeに出力してもらう）
+GOAL_FORMAT = "種目 | 最終目標重量"
 
 
 def _secret(key: str) -> str:
@@ -173,10 +179,52 @@ def create_record(token: str, *, week, split, exercise, goal="",
     resp.raise_for_status()
 
 
+def upsert_goal(token: str, df: pd.DataFrame, exercise: str, goal_weight: str) -> None:
+    """最終目標(週='目標')を種目ごとに1行だけ持つ。既にあれば目標重量を更新、無ければ作成。"""
+    existing = df[(df["週"] == GOAL_WEEK) & (df["種目"] == exercise)]
+    if not existing.empty:
+        page_id = existing.iloc[0]["page_id"]
+        resp = requests.patch(
+            f"{API}/pages/{page_id}", headers=_headers(token),
+            json={"properties": {"目標重量": {"rich_text": [{"text": {"content": goal_weight}}]}}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    else:
+        create_record(token, week=GOAL_WEEK, split=GOAL_WEEK,
+                      exercise=exercise, goal_weight=goal_weight)
+
+
+def parse_goals(text: str):
+    """貼り付けた最終目標をパースして dict のリストにする（'種目 | 目標重量' の1行1種目）。"""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("```"):
+            continue
+        if line.startswith("種目") and "目標" in line:  # ヘッダ行を無視
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            continue
+        out.append({"種目": parts[0], "目標重量": parts[1]})
+    return out
+
+
 def is_bodyweight(row) -> bool:
     """目標重量に数字が無い種目（自重・時間系）は重量入力を出さない。
     例: '自重' / 空欄 / '60秒' → True、'22.5lb(+0)' → False。"""
     return not re.search(r"\d", str(row.get("目標重量") or ""))
+
+
+def parse_target_weight(text) -> float | None:
+    """目標重量の文字列から目標の数値だけ取り出す。
+    例: '22.5lb(+0)'→22.5、'15lb(維持)'→15、'自重'/空欄→None。
+    先頭の数値を目標重量とみなす（末尾の (+0) 等の増減メモは無視）。"""
+    if not text:
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", str(text))
+    return float(m.group()) if m else None
 
 
 def ensure_bodyweight_column(token: str) -> bool:
@@ -608,6 +656,87 @@ with tab_graph:
 
     st.divider()
 
+    # --- 🎯 目標重量に対する現在地 ---------------------------------------
+    # 各種目の目標重量に対し、自己ベストがどこまで来ているかを横棒で可視化する。
+    # 100%（＝目標）に赤の基準線を引き、達成/未達を色分け。
+    # 目標の出どころ：最終目標(週='目標')があればそれ、無ければ今週メニューにフォールバック。
+    st.subheader("🎯 目標に対する現在地")
+    goal_rows = df[df["週"] == GOAL_WEEK]
+    if not goal_rows.empty:
+        goal_src = goal_rows[["種目", "目標重量"]].drop_duplicates("種目", keep="last")
+        src_note = "最終目標（3ヶ月後）"
+    elif latest_week is not None:
+        goal_src = (df[df["週num"] == latest_week][["種目", "目標重量"]]
+                    .drop_duplicates("種目", keep="last"))
+        src_note = (f"今週(W{latest_week})の目標"
+                    " ※3ヶ月後の最終目標は「📤 まとめ＆計画」タブで設定できます")
+    else:
+        goal_src, src_note = pd.DataFrame(columns=["種目", "目標重量"]), ""
+
+    rows = []
+    if not done.empty and not goal_src.empty:
+        best = done.groupby("種目")["実績重量"].max()  # 種目ごとの自己ベスト
+        # 種目ごとの直近の実績（週→日付の順で最後の記録＝今の調子）
+        latest_rec = done.sort_values(["週num", "日付"]).groupby("種目").tail(1)
+        latest_map = dict(zip(latest_rec["種目"], latest_rec["実績重量"]))
+        for _, r in goal_src.iterrows():
+            target = parse_target_weight(r["目標重量"])
+            if not target or target <= 0:
+                continue  # 自重・時間系など目標が数値でない種目は対象外
+            ex = r["種目"]
+            bv = best.get(ex)
+            bv = float(bv) if pd.notna(bv) else None
+            lv = latest_map.get(ex)
+            lv = float(lv) if pd.notna(lv) else None
+            rows.append({
+                "種目": ex,
+                "目標": target,
+                "ベスト": bv, "ベスト率": (bv / target * 100) if bv is not None else 0.0,
+                "直近": lv, "直近率": (lv / target * 100) if lv is not None else 0.0,
+            })
+
+    if rows:
+        gdf = pd.DataFrame(rows).sort_values("ベスト率")
+
+        def _lbl(kg, pct):
+            return "" if kg is None else f"{kg:g}（{pct:.0f}%）"
+
+        figg = go.Figure()
+        # ベスト（自己最高）を上段の棒に。直近（今の調子）を下段の棒に。
+        figg.add_trace(go.Bar(
+            y=gdf["種目"], x=gdf["ベスト率"], orientation="h", name="ベスト",
+            marker_color="#2ca02c",
+            text=[_lbl(k, p) for k, p in zip(gdf["ベスト"], gdf["ベスト率"])],
+            textposition="outside", cliponaxis=False, hoverinfo="skip",
+        ))
+        figg.add_trace(go.Bar(
+            y=gdf["種目"], x=gdf["直近率"], orientation="h", name="直近",
+            marker_color="#4c78d8",
+            text=[_lbl(k, p) for k, p in zip(gdf["直近"], gdf["直近率"])],
+            textposition="outside", cliponaxis=False, hoverinfo="skip",
+        ))
+        figg.add_vline(
+            x=100, line_dash="dash", line_color="#d62728",
+            annotation_text="目標", annotation_position="top",
+        )
+        figg.update_layout(
+            barmode="group", height=max(280, 62 * len(gdf) + 100),
+            xaxis_title="目標達成率 (%)",
+            xaxis_range=[0, max(115, gdf[["ベスト率", "直近率"]].max().max() * 1.15)],
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=10, r=40, t=40, b=10),
+        )
+        st.plotly_chart(figg, use_container_width=True)
+        st.caption(
+            f"{src_note}に対して、各種目の重量が何%まで来ているか。"
+            "🟢ベスト＝自己最高 / 🔵直近＝いちばん最近の記録。赤い点線（100%）が目標。"
+        )
+    else:
+        st.info("目標重量が数値の実績がまだありません。"
+                "「📤 まとめ＆計画」タブで最終目標を設定するか、今日の記録を入力してください。")
+
+    st.divider()
+
     st.subheader("📈 重量の推移")
     if done.empty:
         st.info("まだ実績がありません。「今日の記録」から入力してください。")
@@ -728,3 +857,51 @@ with tab_plan:
                 st.error("一部失敗:\n" + "\n".join(errors[:5]))
     elif pasted.strip():
         st.info("解析できる行がありませんでした。形式を確認してください（パイプ区切り）。")
+
+    st.divider()
+
+    # --- ③ 最終目標(3ヶ月後)を設定 ---
+    st.subheader("③ 最終目標を設定（3ヶ月後・グラフの基準）")
+    st.caption(
+        "ここで設定した目標が「📊 グラフ」タブの『🎯 目標に対する現在地』の基準になります。"
+        "毎週のメニューとは別で、更新するまで固定です。種目名は実績の種目名と一致させてください。"
+    )
+    goals_now = df[df["週"] == GOAL_WEEK][["種目", "目標重量"]].drop_duplicates("種目", keep="last")
+    if not goals_now.empty:
+        st.write(f"**現在の最終目標: {len(goals_now)} 種目**")
+        st.dataframe(goals_now, use_container_width=True, hide_index=True)
+
+    # Claudeに投げる用のお願い文（コピーして貼るだけ）
+    goal_prompt = (
+        "3ヶ月後の最終目標を、下の形式で1種目1行・コードブロックで返してください"
+        "（そのままアプリに貼り込みます。種目名は今の記録と揃えてください）:\n"
+        f"```\n{GOAL_FORMAT}\nレッグプレス | 120kg\nチェストプレス(15°) | 40kg\n```"
+    )
+    st.caption("↓ これをコピーして Claude に投げると、貼り付け用の形式で返してくれます。")
+    st.code(goal_prompt, language="markdown")
+
+    goal_pasted = st.text_area(
+        "最終目標を貼り付け", height=160,
+        placeholder="レッグプレス | 120kg\nチェストプレス(15°) | 40kg\nシーテッドロー | 60kg",
+    )
+    parsed_goals = parse_goals(goal_pasted) if goal_pasted.strip() else []
+    if parsed_goals:
+        st.write(f"**解析結果: {len(parsed_goals)} 種目**")
+        st.dataframe(pd.DataFrame(parsed_goals), use_container_width=True, hide_index=True)
+        if st.button(f"🎯 {len(parsed_goals)} 種目の最終目標を保存/更新", type="primary"):
+            done_cnt, errors = 0, []
+            prog = st.progress(0.0)
+            for i, g in enumerate(parsed_goals):
+                try:
+                    upsert_goal(token, df, g["種目"], g["目標重量"])
+                    done_cnt += 1
+                except requests.HTTPError as e:
+                    errors.append(f"{g['種目']}: {e}")
+                prog.progress((i + 1) / len(parsed_goals))
+            st.cache_data.clear()
+            if done_cnt:
+                st.success(f"{done_cnt} 種目の最終目標を保存しました。「📊 グラフ」で確認できます。")
+            if errors:
+                st.error("一部失敗:\n" + "\n".join(errors[:5]))
+    elif goal_pasted.strip():
+        st.info("解析できる行がありませんでした。`種目 | 目標重量` の形式で貼ってください。")
