@@ -8,6 +8,8 @@ Notion の「トレーニング記録」DB を読み書きする。
 すべて無料の仕組みだけで動く。実行: streamlit run app.py
 """
 
+from __future__ import annotations  # Python 3.9 でも `float | None` 等の型注釈を使えるようにする
+
 import datetime as dt
 import json
 import os
