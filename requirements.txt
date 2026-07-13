@@ -1,5 +1,9 @@
-streamlit>=1.36
-requests>=2.31
-pandas>=2.0
-plotly>=5.20
-streamlit-local-storage>=0.0.25
+# Streamlit Cloud で最新版が自動で入ると壊れる（pandas3.0/numpy2.5 等が
+# Python3.14でSegmentation faultを起こす）ため、動作実績のある版に固定する。
+# ローカル .venv と同じ組み合わせ。Python は 3.12 を想定（Cloudの設定で指定）。
+streamlit==1.50.0
+requests==2.32.5
+pandas==2.3.3
+numpy==2.0.2
+plotly==6.8.0
+streamlit-local-storage==0.0.25
