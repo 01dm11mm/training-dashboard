@@ -5,5 +5,8 @@ streamlit==1.50.0
 requests==2.32.5
 pandas==2.3.3
 numpy==2.0.2
+# pyarrow は streamlit の間接依存。最新の 25.0.0 は st.dataframe 描画時に
+# Segmentation fault を起こすため、ローカルで動作実績のある 21.0.0 に固定。
+pyarrow==21.0.0
 plotly==6.8.0
 streamlit-local-storage==0.0.25
