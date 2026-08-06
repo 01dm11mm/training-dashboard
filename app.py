@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import os
 import re
+import time
 
 import pandas as pd
 import plotly.express as px
@@ -98,8 +99,17 @@ def fetch_records(token: str) -> pd.DataFrame:
     url = f"{API}/databases/{DATABASE_ID}/query"
     rows, payload = [], {"page_size": 100}
     while True:
-        resp = requests.post(url, headers=_headers(token), json=payload, timeout=30)
-        resp.raise_for_status()
+        # 接続エラー/タイムアウトは一過性が多いので数回リトライしてから諦める。
+        # （Cloud→Notion のネットワーク瞬断でアプリごと落ちるのを防ぐ）
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, headers=_headers(token), json=payload, timeout=30)
+                resp.raise_for_status()
+                break
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
         data = resp.json()
         for page in data["results"]:
             p = page["properties"]
@@ -473,6 +483,18 @@ try:
     df = fetch_records(token)
 except requests.HTTPError as e:
     st.error(f"取得に失敗しました: {e}\nトークンと、DB をインテグレーションに共有しているか確認してください。")
+    st.stop()
+except requests.exceptions.RequestException as e:
+    # 接続エラー/タイムアウト等。アプリを落とさず、再試行を促す。
+    st.warning(
+        "Notion への接続に一時的に失敗しました（ネットワークの瞬断など）。"
+        "少し待ってから下のボタンで再試行してください。"
+    )
+    if st.button("🔄 再試行"):
+        st.cache_data.clear()
+        st.rerun()
+    with st.expander("エラー詳細"):
+        st.caption(str(e))
     st.stop()
 
 if df.empty:
