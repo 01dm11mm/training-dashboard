@@ -11,6 +11,7 @@ Notion の「トレーニング記録」DB を読み書きする。
 from __future__ import annotations  # Python 3.9 でも `float | None` 等の型注釈を使えるようにする
 
 import datetime as dt
+import html
 import json
 import os
 import re
@@ -465,6 +466,69 @@ def parse_set_count(goal: str, default: int = 3) -> int:
     if m:
         return min(max(int(m.group(1)), 1), MAX_SETS)
     return default
+
+
+GROWTH_CSS = """
+<style>
+.gr-list { display:flex; flex-direction:column; gap:.45rem; margin:.2rem 0 .6rem; }
+.gr-row {
+  display:grid; grid-template-columns: minmax(7rem,1.4fr) auto minmax(4.5rem,.9fr);
+  align-items:center; gap:.5rem .7rem;
+  background:rgba(128,140,160,.07); border:1px solid rgba(128,140,160,.18);
+  border-left:3px solid #2ca02c; border-radius:9px; padding:.5rem .7rem;
+}
+.gr-row.flat { border-left-color:rgba(128,140,160,.45); }
+.gr-name { font-size:.86rem; font-weight:600; line-height:1.25; overflow-wrap:anywhere; }
+.gr-split { font-size:.66rem; font-weight:500; opacity:.65; margin-left:.3rem; white-space:nowrap; }
+.gr-nums { display:flex; align-items:baseline; gap:.3rem; white-space:nowrap;
+  font-variant-numeric:tabular-nums; }
+.gr-from { font-size:.95rem; opacity:.5; }
+.gr-arw  { font-size:.8rem; opacity:.45; }
+.gr-best { font-size:1.45rem; font-weight:800; color:#2ca02c; letter-spacing:-.02em; }
+.gr-row.flat .gr-best { color:inherit; opacity:.7; }
+.gr-unit { font-size:.72rem; opacity:.6; }
+.gr-right { text-align:right; }
+.gr-delta { font-size:.82rem; font-weight:700; color:#2ca02c; white-space:nowrap; }
+.gr-row.flat .gr-delta { color:inherit; opacity:.55; }
+.gr-sub { font-size:.65rem; opacity:.55; white-space:nowrap; }
+.gr-bar { grid-column:1 / -1; height:.38rem; border-radius:99px;
+  background:rgba(128,140,160,.25); overflow:hidden; display:flex; }
+.gr-bar i { display:block; height:100%; }
+.gr-bar .base { background:rgba(128,140,160,.55); }
+.gr-bar .gain { background:#2ca02c; }
+@media (max-width:520px) {
+  .gr-row { grid-template-columns: 1fr auto; }
+  .gr-right { grid-column:2; }
+}
+</style>
+"""
+
+
+def growth_rows_html(rows, unit: str) -> str:
+    """初回→ベストを1行ずつのカードで描く。棒は『ベストのうち、この15週で伸ばした分』
+    ＝灰色が初回時点、緑が増加分。全行同じ幅なので伸びた割合を横並びで比べられる。"""
+    out = ['<div class="gr-list">']
+    for r in rows:
+        gained = r["ベスト"] > r["初"]
+        base = (r["初"] / r["ベスト"] * 100) if r["ベスト"] else 100
+        name = html.escape(str(r["種目"]))
+        split = html.escape(str(r["分割"] or ""))
+        out.append(
+            f'<div class="gr-row{"" if gained else " flat"}">'
+            f'<div class="gr-name">{name}<span class="gr-split">{split}</span></div>'
+            f'<div class="gr-nums"><span class="gr-from">{r["初"]:g}</span>'
+            f'<span class="gr-arw">→</span>'
+            f'<span class="gr-best">{r["ベスト"]:g}</span>'
+            f'<span class="gr-unit">{unit}</span></div>'
+            f'<div class="gr-right"><div class="gr-delta">'
+            f'{"+" if r["増減"] > 0 else ""}{r["増減"]:g} {unit}</div>'
+            f'<div class="gr-sub">{r["率"]:+.0f}% · W{r["初週"]}→W{r["ベスト週"]}</div></div>'
+            f'<div class="gr-bar"><i class="base" style="width:{base:.1f}%"></i>'
+            f'<i class="gain" style="width:{100 - base:.1f}%"></i></div>'
+            f'</div>'
+        )
+    out.append("</div>")
+    return "".join(out)
 
 
 def reps_exercise_names(df: pd.DataFrame) -> set:
@@ -1259,32 +1323,27 @@ if view == VIEWS[3]:
         s4.metric("達成率", f"{summ['達成率']:.0f}%" if summ["達成率"] is not None else "—")
 
         st.divider()
+        st.markdown(GROWTH_CSS, unsafe_allow_html=True)
         st.markdown("#### 初回 → ベスト（重量種目）")
-        st.caption("左が最初に記録した重量、右が自己ベスト。増加量の大きい順。")
-        st.dataframe(
-            pd.DataFrame([{
-                "種目": f"{r['種目']}（{r['分割']}）",
-                "初回 → ベスト": f"{r['初']:g} → {r['ベスト']:g} lb",
-                "増減": f"+{r['増減']:g} lb" if r["増減"] > 0 else f"{r['増減']:g} lb",
-                "伸び率": f"{r['率']:+.0f}%",
-                "kg": f"{r['初'] * LB_TO_KG:.1f} → {r['ベスト'] * LB_TO_KG:.1f}",
-                "週": f"W{r['初週']} → W{r['ベスト週']}",
-            } for r in wrows]),
-            use_container_width=True, hide_index=True, height=460,
-        )
+        st.caption("薄い数字が最初の記録、**大きい緑がベスト**。"
+                   "バーの緑はこの15週で伸ばした分。増加量の大きい順。")
+        st.markdown(growth_rows_html(wrows, "lb"), unsafe_allow_html=True)
+        with st.expander("kg で見る / 表で見る"):
+            st.dataframe(
+                pd.DataFrame([{
+                    "種目": f"{r['種目']}（{r['分割']}）",
+                    "初回 → ベスト (lb)": f"{r['初']:g} → {r['ベスト']:g}",
+                    "初回 → ベスト (kg)": f"{r['初'] * LB_TO_KG:.1f} → {r['ベスト'] * LB_TO_KG:.1f}",
+                    "増減": r["増減"], "伸び率(%)": round(r["率"]),
+                    "週": f"W{r['初週']} → W{r['ベスト週']}",
+                } for r in wrows]),
+                use_container_width=True, hide_index=True, height=420,
+            )
 
         if rrows:
             st.markdown("#### 初回 → ベスト（回数種目）")
             st.caption("自重・サーキット種目。重量ではなく回数（懸垂は4セット合計）で記録。")
-            st.dataframe(
-                pd.DataFrame([{
-                    "種目": f"{r['種目']}（{r['分割']}）",
-                    "初回 → ベスト": f"{r['初']:g} → {r['ベスト']:g} 回",
-                    "増減": f"+{r['増減']:g} 回" if r["増減"] > 0 else f"{r['増減']:g} 回",
-                    "週": f"W{r['初週']} → W{r['ベスト週']}",
-                } for r in rrows]),
-                use_container_width=True, hide_index=True,
-            )
+            st.markdown(growth_rows_html(rrows, "回"), unsafe_allow_html=True)
 
         bw = df.dropna(subset=["体重", "日付"])
         if not bw.empty:
