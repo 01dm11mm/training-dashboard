@@ -202,8 +202,10 @@ def upsert_goal(token: str, df: pd.DataFrame, exercise: str, goal_weight: str,
     更新で値が変わるときは、古い目標を履歴(週='目標履歴')として別行に残す（上書きで消さない）。"""
     existing = df[(df["週"] == GOAL_WEEK) & (df["種目"] == exercise)]
     if not existing.empty:
-        old = str(existing.iloc[0]["目標重量"] or "")
-        page_id = existing.iloc[0]["page_id"]
+        # 表示側は drop_duplicates(keep="last") で最後の行を見るので、更新もそこに合わせる
+        # （先頭を更新すると「保存しました」と出るのにグラフの目標が変わらない）
+        old = str(existing.iloc[-1]["目標重量"] or "")
+        page_id = existing.iloc[-1]["page_id"]
         if old and old != goal_weight:
             # 旧目標を履歴として保管（週num が数値にならないので週次ビューには出ない）
             create_record(
@@ -264,6 +266,15 @@ def parse_target_weight(text) -> float | None:
     m = re.search(r"合計\s*(\d+(?:\.\d+)?)\s*回", s)  # 「合計30回」→30（総回数が目標）
     if m:
         return float(m.group(1))
+    if is_reps_goal(s):
+        # 『加重10lb×8+自重10』のような回数種目。先頭の加重(10lb)を目標重量と
+        # 誤読すると達成率が数百%になるため、末尾の合計回数を目標とみなす。
+        nums = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)", s)]
+        return sum(nums[1:]) if len(nums) > 1 else (nums[0] if nums else None)
+    # kg で書かれた目標は lb に直す（記録が lb 規約のため）
+    m = re.search(r"(\d+(?:\.\d+)?)\s*kg", s, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) / LB_TO_KG
     m = re.search(r"\d+(?:\.\d+)?", s)
     return float(m.group()) if m else None
 
@@ -293,10 +304,26 @@ def build_best_lookup(done: pd.DataFrame):
     return lookup
 
 
+def is_reps_goal(goal_weight) -> bool:
+    """回数で記録する種目か（懸垂・自重・サーキット）。
+    『加重10lb×8+自重10』のように加重の lb が混ざっていても回数種目なので、
+    lb/kg の有無より先に 自重/周/回 を見る（順序を逆にすると加重種目を
+    重量とみなして kg 換算してしまう）。"""
+    s = str(goal_weight or "")
+    if not s.strip():
+        return False
+    if "自重" in s or "周" in s:
+        return True
+    return "回" in s and not re.search(r"^\s*\d+(?:\.\d+)?\s*(lb|kg)", s, re.IGNORECASE)
+
+
 def is_lb_unit(goal_weight) -> bool:
     """記録が lb（重さ）かどうか。kg 併記してよい種目だけ True。
-    懸垂の『4セット合計42回』のような回数の記録を kg に誤換算しないための判定。"""
+    懸垂の『4セット合計42回』『加重10lb×8+自重10』のような回数の記録を
+    kg に誤換算しないための判定。"""
     s = str(goal_weight or "")
+    if is_reps_goal(s):
+        return False
     if not is_weight_goal(s):
         return False
     if re.search(r"(lb|kg)", s, re.IGNORECASE):
@@ -338,7 +365,9 @@ def ensure_bodyweight_column(token: str) -> bool:
 
 def _apply_master(ex_id: str) -> None:
     """マスター重量を、その種目の全セットの重量ボックスに反映する（on_change用）。"""
-    mv = st.session_state.get(f"m_{ex_id}", 0.0)
+    mv = st.session_state.get(f"m_{ex_id}")
+    if mv is None:
+        return  # マスター未入力。ここで書き戻すと入力済みの重量が全部消える
     n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
     for s in range(n):
         st.session_state[f"w_{ex_id}_{s}"] = mv
@@ -368,7 +397,11 @@ def build_log(sets, bw: bool):
         wv = weights[0]
         reps_str = ",".join(str(rv) for _, rv in sets)
         return (f"{wv:g}×{reps_str}" if wv > 0 else reps_str), (wv if wv > 0 else None)
-    return ", ".join(f"{wv:g}×{rv}" for wv, rv in sets), max(weights)
+    # 実績重量は「全セットこなした重量」。1セットだけ上げた重量は最大に数えない
+    # （2セット以上こなした最大重量。無ければ最も軽い＝確実にこなした重量）。
+    sustained = [w for w in set(weights) if weights.count(w) >= 2]
+    top = max(sustained) if sustained else min(weights)
+    return ", ".join(f"{wv:g}×{rv}" for wv, rv in sets), top
 
 
 def serialize_draft() -> str:
@@ -390,16 +423,21 @@ def clear_input_state() -> None:
             del st.session_state[k]
 
 
+MAX_SETS = 12  # セット数入力の上限。推定値もここに収める
+
+
 def parse_set_count(goal: str, default: int = 3) -> int:
-    """目標文字列からセット数を推定。例: '4×6-10'→4, '3×10'→3, '4セット'→4, '3周'→3。"""
+    """目標文字列からセット数を推定。例: '4×6-10'→4, '3×10'→3, '4セット'→4, '3周'→3。
+    『15×3』のように回数×セットで書かれても入力欄の上限を超えないよう 1〜MAX_SETS に収める
+    （超えると number_input が例外を投げ、その週の入力画面が丸ごと開けなくなる）。"""
     if not goal:
         return default
     m = re.match(r"\s*(\d+)\s*[×xX✕*]", goal)
     if m:
-        return int(m.group(1))
+        return min(max(int(m.group(1)), 1), MAX_SETS)
     m = re.search(r"(\d+)\s*(セット|周|set)", goal, re.IGNORECASE)
     if m:
-        return int(m.group(1))
+        return min(max(int(m.group(1)), 1), MAX_SETS)
     return default
 
 
@@ -566,11 +604,15 @@ latest_week = int(df["週num"].max()) if df["週num"].notna().any() else None
 # タブではなく選択式にする。st.tabs は再実行(「最新に更新」等)のたびに先頭へ戻るが、
 # segmented_control は key で選択が session_state に残るので、更新しても同じ画面のまま。
 VIEWS = ["✍️ 今日の記録", "📊 グラフ", "📤 まとめ＆計画"]
+# segmented_control は選択中の項目をもう一度タップすると選択解除されて None を返す。
+# その場合は直前の画面を保つ（そうしないと誤タップで「今日の記録」に飛ばされる）。
+if "view_last" not in st.session_state:
+    st.session_state["view_last"] = VIEWS[0]
 if st.session_state.get("view_sel") not in VIEWS:
-    st.session_state["view_sel"] = VIEWS[0]
-view = st.segmented_control(
-    "表示", VIEWS, key="view_sel", label_visibility="collapsed",
-) or st.session_state["view_sel"]
+    st.session_state["view_sel"] = st.session_state["view_last"]
+picked = st.segmented_control("表示", VIEWS, key="view_sel", label_visibility="collapsed")
+view = picked if picked in VIEWS else st.session_state["view_last"]
+st.session_state["view_last"] = view
 
 # =====================================================================
 # ✍️ 今日の記録 — 今週の種目に実績を埋める
@@ -608,6 +650,10 @@ if view == VIEWS[0]:
 
     weeks = sorted([int(w) for w in df["週num"].dropna().unique()])
     c1, c2, c3 = st.columns([1, 1, 1])
+    # 下書きから復元した週が今の一覧に無い（Notion側で消した等）と selectbox が
+    # 例外を投げて入力画面が開けなくなるため、範囲外なら最新週に戻す。
+    if weeks and st.session_state.get("week_sel") not in weeks:
+        st.session_state["week_sel"] = weeks[-1]
     if "week_sel" not in st.session_state and weeks:
         st.session_state["week_sel"] = weeks[-1]
     week_sel = c1.selectbox("週", weeks, format_func=lambda w: f"W{w}", key="week_sel")
@@ -717,7 +763,11 @@ if view == VIEWS[0]:
                 n = int(st.session_state.get(f"n_{ex_id}", 0) or 0)
                 ach = st.session_state.get(f"a_{ex_id}", "（未入力）")
                 sets = collect_sets(ex_id, bw, n)
-                if not sets and ach == "（未入力）":
+                # 「達成」欄はNotionの既存値で初期化されるため、何も入力していない行でも
+                # ach が埋まっている。それを保存対象にすると日付だけ今日で上書きされ、
+                # 過去の実施日が静かに壊れるので、実際に変化がある行だけ保存する。
+                unchanged = (ach == "（未入力）") or (ach == row["達成"])
+                if not sets and unchanged:
                     continue
                 log, top_weight = build_log(sets, bw)
                 try:
@@ -738,6 +788,12 @@ if view == VIEWS[0]:
                 except requests.HTTPError as e:
                     errors.append(str(e))
             st.cache_data.clear()
+            if saved and not errors:
+                # 保存できたら端末の下書きも消す。残すと次回「未保存の入力を復元しました」
+                # と嘘のトーストが出て、保存済みの値がまた画面に載る。
+                clear_input_state()
+                ls.deleteItem(DRAFT_KEY, key="tl_del_saved")
+                st.session_state["_draft_last"] = None
             if saved:
                 st.success(f"{saved} 件保存しました。")
             if errors:
@@ -918,7 +974,11 @@ if view == VIEWS[1]:
             )
             pb.columns = ["種目", "最大実績重量"]
             # 記録は lb だが感覚を掴みやすいよう kg も併記（自重・回数系は換算しない）
-            goal_txt = dict(zip(df["種目"], df["目標重量"]))
+            # 種目が回数系かは、その種目のどれか1つでも回数目標があれば回数系とみなす。
+            # （取得順に依存する dict(zip(...)) だと kg 列が出たり出なかったりする）
+            reps_names = {ex for ex, gw in zip(df["種目"], df["目標重量"]) if is_reps_goal(gw)}
+            goal_txt = {ex: gw for ex, gw in zip(df["種目"], df["目標重量"])
+                        if gw and ex not in reps_names}
             pb["kg"] = [
                 round(v * LB_TO_KG, 1) if is_lb_unit(goal_txt.get(ex, "")) else None
                 for ex, v in zip(pb["種目"], pb["最大実績重量"])
@@ -1036,14 +1096,14 @@ if view == VIEWS[2]:
     goal_prompt = (
         "3ヶ月後の最終目標を、下の形式で1種目1行・コードブロックで返してください"
         "（そのままアプリに貼り込みます。種目名は今の記録と揃えてください）:\n"
-        f"```\n{GOAL_FORMAT}\nレッグプレス | 120kg\nチェストプレス(15°) | 40kg\n```"
+        f"```\n{GOAL_FORMAT}\nレッグプレス | 270lb\nチェストプレス(LOW angle) | 175lb\n```"
     )
     st.caption("↓ これをコピーして Claude に投げると、貼り付け用の形式で返してくれます。")
     st.code(goal_prompt, language="markdown")
 
     goal_pasted = st.text_area(
         "最終目標を貼り付け", height=160,
-        placeholder="レッグプレス | 120kg\nチェストプレス(15°) | 40kg\nシーテッドロー | 60kg",
+        placeholder="レッグプレス | 270lb\nチェストプレス(LOW angle) | 175lb\nシーテッドロー | 75lb",
     )
     parsed_goals = parse_goals(goal_pasted) if goal_pasted.strip() else []
     if parsed_goals:
