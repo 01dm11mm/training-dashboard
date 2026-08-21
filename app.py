@@ -34,11 +34,15 @@ PARTS_OPTIONS = ["胸", "背中", "肩", "脚", "腕", "腹", "体幹"]
 # 来週メニューの貼り付け形式
 MENU_FORMAT = "分割 | 種目 | 目標 | 目標重量 | 部位(任意,カンマ区切り)"
 DRAFT_KEY = "tl_draft"  # 入力中の下書きを端末(ブラウザ)に一時保存するキー
-# 下書きとして保存する session_state のキー接頭辞（重量/回数/マスター/セット数/達成）
-DRAFT_PREFIXES = ("w_", "r_", "m_", "n_", "a_")
+# 下書きとして保存する session_state のキー接頭辞（重量/回数/マスター/達成）。
+# セット数(n_)は目標から毎回自動推定する値なので下書きに含めない。
+# （含めると古い「1セット」等が端末に残り続け、毎回それが復元されてしまう）
+DRAFT_PREFIXES = ("w_", "r_", "m_", "a_")
 # 最終目標(3ヶ月後)を持たせるセンチネル行の週。通常の週(数値)と分けるための固定値。
 # 週num が数値にならないので、週次のビュー(入力/まとめ/推移)には一切出てこない。
 GOAL_WEEK = "目標"
+# 目標を更新したとき、古い目標を残しておく行の週（履歴。グラフ・週次ビューには出ない）
+GOAL_HISTORY_WEEK = "目標履歴"
 # 最終目標の貼り付け形式（Claudeに出力してもらう）
 GOAL_FORMAT = "種目 | 最終目標重量"
 
@@ -191,11 +195,20 @@ def create_record(token: str, *, week, split, exercise, goal="",
     resp.raise_for_status()
 
 
-def upsert_goal(token: str, df: pd.DataFrame, exercise: str, goal_weight: str) -> None:
-    """最終目標(週='目標')を種目ごとに1行だけ持つ。既にあれば目標重量を更新、無ければ作成。"""
+def upsert_goal(token: str, df: pd.DataFrame, exercise: str, goal_weight: str,
+                until_week=None) -> None:
+    """最終目標(週='目標')を種目ごとに1行だけ持つ。既にあれば目標重量を更新、無ければ作成。
+    更新で値が変わるときは、古い目標を履歴(週='目標履歴')として別行に残す（上書きで消さない）。"""
     existing = df[(df["週"] == GOAL_WEEK) & (df["種目"] == exercise)]
     if not existing.empty:
+        old = str(existing.iloc[0]["目標重量"] or "")
         page_id = existing.iloc[0]["page_id"]
+        if old and old != goal_weight:
+            # 旧目標を履歴として保管（週num が数値にならないので週次ビューには出ない）
+            create_record(
+                token, week=GOAL_HISTORY_WEEK, split=GOAL_HISTORY_WEEK, exercise=exercise,
+                goal=(f"〜W{until_week} の目標" if until_week else "旧目標"), goal_weight=old,
+            )
         resp = requests.patch(
             f"{API}/pages/{page_id}", headers=_headers(token),
             json={"properties": {"目標重量": {"rich_text": [{"text": {"content": goal_weight}}]}}},
@@ -326,7 +339,7 @@ def serialize_draft() -> str:
 def clear_input_state() -> None:
     """入力欄（重量/回数/マスター/セット数/達成/体重）の session_state を消す。"""
     for k in list(st.session_state.keys()):
-        if k.startswith(DRAFT_PREFIXES) or k == "bw_today":
+        if k.startswith(DRAFT_PREFIXES) or k.startswith("n_") or k == "bw_today":
             del st.session_state[k]
 
 
@@ -503,12 +516,19 @@ if df.empty:
 
 latest_week = int(df["週num"].max()) if df["週num"].notna().any() else None
 
-tab_input, tab_graph, tab_plan = st.tabs(["✍️ 今日の記録", "📊 グラフ", "📤 まとめ＆計画"])
+# タブではなく選択式にする。st.tabs は再実行(「最新に更新」等)のたびに先頭へ戻るが、
+# segmented_control は key で選択が session_state に残るので、更新しても同じ画面のまま。
+VIEWS = ["✍️ 今日の記録", "📊 グラフ", "📤 まとめ＆計画"]
+if st.session_state.get("view_sel") not in VIEWS:
+    st.session_state["view_sel"] = VIEWS[0]
+view = st.segmented_control(
+    "表示", VIEWS, key="view_sel", label_visibility="collapsed",
+) or st.session_state["view_sel"]
 
 # =====================================================================
 # ✍️ 今日の記録 — 今週の種目に実績を埋める
 # =====================================================================
-with tab_input:
+if view == VIEWS[0]:
     st.subheader("今日の記録を入力")
 
     ls = LocalStorage()
@@ -527,6 +547,8 @@ with tab_input:
                 draft = None
             if isinstance(draft, dict) and draft:
                 for k, v in draft.items():
+                    if k.startswith("n_"):
+                        continue  # 旧バージョンが保存したセット数は無視（目標から再推定する）
                     if k == "rec_date" and v:
                         try:
                             st.session_state["rec_date"] = dt.date.fromisoformat(v)
@@ -686,7 +708,7 @@ with tab_input:
 # =====================================================================
 # 📊 グラフ
 # =====================================================================
-with tab_graph:
+if view == VIEWS[1]:
     done = df.dropna(subset=["実績重量"]).copy()
 
     # 目標(3ヶ月後/今週)に対する達成率：各種目のベスト÷目標の平均（100%上限）。
@@ -866,7 +888,7 @@ with tab_graph:
 # =====================================================================
 # 📤 まとめ＆計画 — Claudeとの週次ループ
 # =====================================================================
-with tab_plan:
+if view == VIEWS[2]:
     # --- ① 今週のまとめを出力 ---
     st.subheader("① 今週のまとめを出力（Claudeに投げる）")
     weeks = sorted([int(w) for w in df["週num"].dropna().unique()])
@@ -934,6 +956,13 @@ with tab_plan:
     if not goals_now.empty:
         st.write(f"**現在の最終目標: {len(goals_now)} 種目**")
         st.dataframe(goals_now, use_container_width=True, hide_index=True)
+    st.caption("目標を更新すると、古い目標は消えずに履歴として保管されます（下で確認できます）。")
+
+    hist = df[df["週"] == GOAL_HISTORY_WEEK][["種目", "目標", "目標重量"]]
+    if not hist.empty:
+        with st.expander(f"🗂 過去の目標の履歴（{len(hist)} 件）"):
+            st.dataframe(hist.rename(columns={"目標": "期間"}),
+                         use_container_width=True, hide_index=True)
 
     # Claudeに投げる用のお願い文（コピーして貼るだけ）
     goal_prompt = (
@@ -957,7 +986,7 @@ with tab_plan:
             prog = st.progress(0.0)
             for i, g in enumerate(parsed_goals):
                 try:
-                    upsert_goal(token, df, g["種目"], g["目標重量"])
+                    upsert_goal(token, df, g["種目"], g["目標重量"], until_week=latest_week)
                     done_cnt += 1
                 except requests.HTTPError as e:
                     errors.append(f"{g['種目']}: {e}")
