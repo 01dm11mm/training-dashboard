@@ -1259,52 +1259,32 @@ if view == VIEWS[3]:
         s4.metric("達成率", f"{summ['達成率']:.0f}%" if summ["達成率"] is not None else "—")
 
         st.divider()
-        st.markdown("#### 主要リフトの伸び（増加量トップ6）")
-        cols = st.columns(3)
-        for i, r in enumerate(wrows[:6]):
-            with cols[i % 3]:
-                st.metric(
-                    f"{r['種目']}（{r['分割']}）",
-                    f"{r['ベスト']:g} lb", f"+{r['増減']:g} lb（{r['率']:+.0f}%）",
-                    help=f"W{r['初週']} {r['初']:g}lb → W{r['ベスト週']} {r['ベスト']:g}lb"
-                         f"（{r['初'] * LB_TO_KG:.0f} → {r['ベスト'] * LB_TO_KG:.0f} kg）",
-                )
-
-        st.divider()
-        st.markdown("#### 伸び率トップ15")
-        top = sorted(wrows, key=lambda r: -r["率"])[:15]
-        tdf = pd.DataFrame([{
-            "種目": f"{r['種目']}（{r['分割']}）", "伸び率": r["率"],
-            "初回": r["初"], "ベスト": r["ベスト"],
-        } for r in top]).sort_values("伸び率")
-        figg = go.Figure(go.Bar(
-            y=tdf["種目"], x=tdf["伸び率"], orientation="h", marker_color="#4c78d8",
-            text=[f"{v:+.0f}%" for v in tdf["伸び率"]], textposition="outside",
-            cliponaxis=False, customdata=tdf[["初回", "ベスト"]],
-            hovertemplate="初回 %{customdata[0]} → ベスト %{customdata[1]} lb<extra>%{y}</extra>",
-        ))
-        figg.update_layout(height=max(320, 30 * len(tdf) + 90), xaxis_title="伸び率 (%)",
-                           margin=dict(l=6, r=40, t=20, b=10), yaxis=dict(automargin=True))
-        st.plotly_chart(figg, use_container_width=True)
-
-        st.divider()
-        st.markdown("#### 重量種目の記録")
-        st.caption("増加量の大きい順。kg は lb×0.4536 の換算。")
-        st.dataframe(pd.DataFrame([{
-            "種目": r["種目"], "分割": r["分割"],
-            "初回(lb)": r["初"], "ベスト(lb)": r["ベスト"],
-            "kg(初→ベスト)": f"{r['初'] * LB_TO_KG:.1f} → {r['ベスト'] * LB_TO_KG:.1f}",
-            "増減": r["増減"], "伸び率(%)": round(r["率"]), "記録週": r["週数"],
-            "ベスト週": f"W{r['ベスト週']}",
-        } for r in wrows]), use_container_width=True, hide_index=True, height=420)
+        st.markdown("#### 初回 → ベスト（重量種目）")
+        st.caption("左が最初に記録した重量、右が自己ベスト。増加量の大きい順。")
+        st.dataframe(
+            pd.DataFrame([{
+                "種目": f"{r['種目']}（{r['分割']}）",
+                "初回 → ベスト": f"{r['初']:g} → {r['ベスト']:g} lb",
+                "増減": f"+{r['増減']:g} lb" if r["増減"] > 0 else f"{r['増減']:g} lb",
+                "伸び率": f"{r['率']:+.0f}%",
+                "kg": f"{r['初'] * LB_TO_KG:.1f} → {r['ベスト'] * LB_TO_KG:.1f}",
+                "週": f"W{r['初週']} → W{r['ベスト週']}",
+            } for r in wrows]),
+            use_container_width=True, hide_index=True, height=460,
+        )
 
         if rrows:
-            st.markdown("#### 回数で記録する種目")
-            st.caption("自重・サーキット種目。重量ではなく回数（懸垂は合計回数）で記録。")
-            st.dataframe(pd.DataFrame([{
-                "種目": r["種目"], "分割": r["分割"], "初回": r["初"],
-                "ベスト": r["ベスト"], "増減": r["増減"], "記録週": r["週数"],
-            } for r in rrows]), use_container_width=True, hide_index=True)
+            st.markdown("#### 初回 → ベスト（回数種目）")
+            st.caption("自重・サーキット種目。重量ではなく回数（懸垂は4セット合計）で記録。")
+            st.dataframe(
+                pd.DataFrame([{
+                    "種目": f"{r['種目']}（{r['分割']}）",
+                    "初回 → ベスト": f"{r['初']:g} → {r['ベスト']:g} 回",
+                    "増減": f"+{r['増減']:g} 回" if r["増減"] > 0 else f"{r['増減']:g} 回",
+                    "週": f"W{r['初週']} → W{r['ベスト週']}",
+                } for r in rrows]),
+                use_container_width=True, hide_index=True,
+            )
 
         bw = df.dropna(subset=["体重", "日付"])
         if not bw.empty:
