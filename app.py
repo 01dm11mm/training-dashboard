@@ -268,6 +268,31 @@ def parse_target_weight(text) -> float | None:
     return float(m.group()) if m else None
 
 
+def build_best_lookup(done: pd.DataFrame):
+    """目標の種目名から自己ベストを引く関数を作る。
+    目標行は分割まで書き分けられることがある（例『ショルダープレス(Push A)』は
+    ダンベル、『(Push B)』はマシンで別物）。実績側の種目名は『ショルダープレス』
+    のみで分割列で区別されるため、名前だけの突き合わせだと一致せず、
+    その種目がグラフから丸ごと消えてしまう。末尾の (分割) を解釈して救う。"""
+    if done.empty:
+        return lambda name: None
+    by_name = done.groupby("種目")["実績重量"].max()
+    by_pair = done.groupby(["種目", "分割"])["実績重量"].max()
+
+    def lookup(name):
+        v = by_name.get(name)
+        if pd.notna(v):
+            return float(v)
+        m = re.match(r"^(.*)\((.+)\)$", str(name or "").strip())
+        if m and m.group(2) in SPLITS:
+            v = by_pair.get((m.group(1).strip(), m.group(2)))
+            if pd.notna(v):
+                return float(v)
+        return None
+
+    return lookup
+
+
 def is_lb_unit(goal_weight) -> bool:
     """記録が lb（重さ）かどうか。kg 併記してよい種目だけ True。
     懸垂の『4セット合計42回』のような回数の記録を kg に誤換算しないための判定。"""
@@ -741,14 +766,14 @@ if view == VIEWS[1]:
         _gsrc = df[df["週num"] == latest_week][["種目", "目標重量"]].drop_duplicates("種目", keep="last")
     else:
         _gsrc = pd.DataFrame(columns=["種目", "目標重量"])
-    _best = done.groupby("種目")["実績重量"].max() if not done.empty else pd.Series(dtype=float)
+    _lookup = build_best_lookup(done)
     _ratios, _reached = [], 0
     for _, _r in _gsrc.iterrows():
         if not is_weight_goal(_r["目標重量"]):
             continue
         _t = parse_target_weight(_r["目標重量"])
-        _b = _best.get(_r["種目"])
-        if pd.isna(_b):
+        _b = _lookup(_r["種目"])
+        if _b is None:
             continue
         _ratio = float(_b) / _t
         _ratios.append(min(_ratio, 1.0))
@@ -787,21 +812,32 @@ if view == VIEWS[1]:
 
     rows = []
     if not done.empty and not goal_src.empty:
-        best = done.groupby("種目")["実績重量"].max()  # 種目ごとの自己ベスト
+        lookup_best = build_best_lookup(done)  # 目標名の (分割) も解釈して引く
         # 種目ごとの直近の実績（週→日付の順で最後の記録＝今の調子）
-        latest_rec = done.sort_values(["週num", "日付"]).groupby("種目").tail(1)
-        latest_map = dict(zip(latest_rec["種目"], latest_rec["実績重量"]))
+        lat = done.sort_values(["週num", "日付"])
+        latest_by_name = lat.groupby("種目")["実績重量"].last()
+        latest_by_pair = lat.groupby(["種目", "分割"])["実績重量"].last()
+
+        def lookup_latest(name):
+            v = latest_by_name.get(name)
+            if pd.notna(v):
+                return float(v)
+            m = re.match(r"^(.*)\((.+)\)$", str(name or "").strip())
+            if m and m.group(2) in SPLITS:
+                v = latest_by_pair.get((m.group(1).strip(), m.group(2)))
+                if pd.notna(v):
+                    return float(v)
+            return None
+
         for _, r in goal_src.iterrows():
             if not is_weight_goal(r["目標重量"]):
                 continue  # 自重・サーキット系（周/自重）は重量の現在地に出さない
             target = parse_target_weight(r["目標重量"])
             ex = r["種目"]
-            bv = best.get(ex)
-            if pd.isna(bv):
+            bv = lookup_best(ex)
+            if bv is None:
                 continue  # 実績がまだ無い種目は位置を出せないので非表示
-            bv = float(bv)
-            lv = latest_map.get(ex)
-            lv = float(lv) if pd.notna(lv) else None
+            lv = lookup_latest(ex)
             rows.append({
                 "種目": ex, "目標": target, "lb": is_lb_unit(r["目標重量"]),
                 "ベスト": bv, "ベスト率": bv / target * 100,
