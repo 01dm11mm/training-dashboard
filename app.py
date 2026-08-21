@@ -45,6 +45,7 @@ GOAL_WEEK = "目標"
 GOAL_HISTORY_WEEK = "目標履歴"
 # 最終目標の貼り付け形式（Claudeに出力してもらう）
 GOAL_FORMAT = "種目 | 最終目標重量"
+LB_TO_KG = 0.4536  # 記録は lb。表示で kg を併記するときの換算係数
 
 
 def _secret(key: str) -> str:
@@ -255,6 +256,17 @@ def parse_target_weight(text) -> float | None:
         return float(m.group(1))
     m = re.search(r"\d+(?:\.\d+)?", s)
     return float(m.group()) if m else None
+
+
+def is_lb_unit(goal_weight) -> bool:
+    """記録が lb（重さ）かどうか。kg 併記してよい種目だけ True。
+    懸垂の『4セット合計42回』のような回数の記録を kg に誤換算しないための判定。"""
+    s = str(goal_weight or "")
+    if not is_weight_goal(s):
+        return False
+    if re.search(r"(lb|kg)", s, re.IGNORECASE):
+        return True
+    return "回" not in s and "周" not in s
 
 
 def is_weight_goal(goal_weight) -> bool:
@@ -781,7 +793,7 @@ if view == VIEWS[1]:
             lv = latest_map.get(ex)
             lv = float(lv) if pd.notna(lv) else None
             rows.append({
-                "種目": ex, "目標": target,
+                "種目": ex, "目標": target, "lb": is_lb_unit(r["目標重量"]),
                 "ベスト": bv, "ベスト率": bv / target * 100,
                 "直近": lv, "直近率": (lv / target * 100) if lv is not None else None,
             })
@@ -792,15 +804,18 @@ if view == VIEWS[1]:
         colors = ["#2ca02c" if p >= 100 else "#4c78d8" for p in gdf["ベスト率"]]
         labels = [f"{b:g} / {t:g}（{p:.0f}%）"
                   for b, t, p in zip(gdf["ベスト"], gdf["目標"], gdf["ベスト率"])]
-        # ホバー用に 直近 を渡す（棒はベスト基準、直近はタップで確認）
-        cd = [[f"{b:g}", (f"{lv:g}" if lv is not None else "—"), f"{t:g}"]
-              for b, lv, t in zip(gdf["ベスト"], gdf["直近"], gdf["目標"])]
+        # ホバー用に 直近 と kg 換算を渡す（棒はベスト基準、直近はタップで確認）
+        cd = [[f"{b:g}", (f"{lv:g}" if lv is not None else "—"), f"{t:g}",
+               (f"ベスト {b * LB_TO_KG:.1f}kg / 目標 {t * LB_TO_KG:.1f}kg" if islb
+                else "回数で記録する種目（kg換算なし）")]
+              for b, lv, t, islb in zip(gdf["ベスト"], gdf["直近"], gdf["目標"], gdf["lb"])]
         figg = go.Figure(go.Bar(
             y=gdf["種目"], x=gdf["ベスト率"], orientation="h",
             marker_color=colors, text=labels, textposition="outside",
             cliponaxis=False, customdata=cd,
             hovertemplate=("ベスト %{customdata[0]} / 直近 %{customdata[1]} / "
-                           "目標 %{customdata[2]}（%{x:.0f}%）<extra>%{y}</extra>"),
+                           "目標 %{customdata[2]}（%{x:.0f}%）<br>"
+                           "%{customdata[3]}<extra>%{y}</extra>"),
         ))
         figg.add_vline(x=100, line_dash="dash", line_color="#d62728",
                        annotation_text="目標", annotation_position="top")
@@ -856,7 +871,14 @@ if view == VIEWS[1]:
                 .sort_values(ascending=False).reset_index()
             )
             pb.columns = ["種目", "最大実績重量"]
+            # 記録は lb だが感覚を掴みやすいよう kg も併記（自重・回数系は換算しない）
+            goal_txt = dict(zip(df["種目"], df["目標重量"]))
+            pb["kg"] = [
+                round(v * LB_TO_KG, 1) if is_lb_unit(goal_txt.get(ex, "")) else None
+                for ex, v in zip(pb["種目"], pb["最大実績重量"])
+            ]
             st.dataframe(pb, use_container_width=True, hide_index=True, height=360)
+            st.caption(f"kg は lb×{LB_TO_KG} の換算。回数で記録する種目（懸垂・自重）は空欄。")
 
         with col_ac:
             st.subheader("🎯 達成状況の内訳")
