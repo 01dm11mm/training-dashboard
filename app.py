@@ -238,9 +238,19 @@ def parse_goals(text: str):
 
 
 def is_bodyweight(row) -> bool:
-    """目標重量に数字が無い種目（自重・時間系）は重量入力を出さない。
-    例: '自重' / 空欄 / '60秒' → True、'22.5lb(+0)' → False。"""
-    return not re.search(r"\d", str(row.get("目標重量") or ""))
+    """回数だけを記録する種目（自重・サーキット・時間系）は重量入力を出さない。
+    '自重'や'周'が入っていれば数字があっても回数種目とみなす。
+    例: '自重(セット増)' / '3周' / '自重20回' / 空欄 / 懸垂の'加重10lb×8+自重10' → True、
+        '22.5lb(+0)' → False。
+    （数字の有無だけで判定していた頃は '3周' や '自重20回' に重量欄が出てしまい、
+      回数が実績重量として記録される原因になっていた）"""
+    s = str(row.get("目標重量") or "")
+    if "自重" in s or "周" in s:
+        return True
+    if not re.search(r"\d", s):
+        return True
+    # 単位が無く「回」だけの目標（例: '20回'）も回数種目
+    return "回" in s and not re.search(r"(lb|kg)", s, re.IGNORECASE)
 
 
 def parse_target_weight(text) -> float | None:
