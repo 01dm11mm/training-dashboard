@@ -37,7 +37,7 @@ DRAFT_KEY = "tl_draft"  # 入力中の下書きを端末(ブラウザ)に一時�
 # 下書きとして保存する session_state のキー接頭辞（重量/回数/マスター/達成）。
 # セット数(n_)は目標から毎回自動推定する値なので下書きに含めない。
 # （含めると古い「1セット」等が端末に残り続け、毎回それが復元されてしまう）
-DRAFT_PREFIXES = ("w_", "r_", "m_", "a_")
+DRAFT_PREFIXES = ("w_", "r_", "m_", "a_", "g_")
 # 最終目標(3ヶ月後)を持たせるセンチネル行の週。通常の週(数値)と分けるための固定値。
 # 週num が数値にならないので、週次のビュー(入力/まとめ/推移)には一切出てこない。
 GOAL_WEEK = "目標"
@@ -279,6 +279,15 @@ def parse_target_weight(text) -> float | None:
     return float(m.group()) if m else None
 
 
+def filter_by_load(done: pd.DataFrame, required: float) -> pd.DataFrame:
+    """加重目標のとき、その加重以上で行った記録だけに絞る。
+    懸垂『加重25lb × 合計32回』の目標に対し、自重42回を達成扱いにしないため。"""
+    if not required:
+        return done
+    loads = done["実績ログ"].map(parse_added_load)
+    return done[loads >= required]
+
+
 def build_best_lookup(done: pd.DataFrame):
     """目標の種目名から自己ベストを引く関数を作る。
     目標行は分割まで書き分けられることがある（例『ショルダープレス(Push A)』は
@@ -315,6 +324,19 @@ def is_reps_goal(goal_weight) -> bool:
     if "自重" in s or "周" in s:
         return True
     return "回" in s and not re.search(r"^\s*\d+(?:\.\d+)?\s*(lb|kg)", s, re.IGNORECASE)
+
+
+def parse_added_load(text) -> float:
+    """加重（自重に足したおもり）の lb を取り出す。無ければ 0。
+    目標側の『加重10lb × 3セット合計45回』と、実績ログ側の『+10lb 12,10,10回』の
+    両方に対応する。懸垂やハンギングレッグレイズは実績重量に合計回数しか入らないため、
+    加重したかどうかはこの値でしか判別できない。"""
+    s = str(text or "")
+    m = re.search(r"(?:加重|\+)\s*(\d+(?:\.\d+)?)\s*(lb|kg)", s, re.IGNORECASE)
+    if not m:
+        return 0.0
+    v = float(m.group(1))
+    return v / LB_TO_KG if m.group(2).lower() == "kg" else v
 
 
 def is_lb_unit(goal_weight) -> bool:
@@ -384,15 +406,19 @@ def collect_sets(ex_id: str, bw: bool, n: int):
     return sets
 
 
-def build_log(sets, bw: bool):
+def build_log(sets, bw: bool, added=0.0):
     """セット一覧から (実績ログ文字列, 実績重量) を作る。
-    自重種目は回数だけ記録し、実績重量＝合計回数（懸垂と同じ規約、推移グラフ用）。"""
+    自重種目は回数だけ記録し、実績重量＝合計回数（懸垂と同じ規約、推移グラフ用）。
+    加重した場合はログ先頭に『+10lb』を残す。実績重量は合計回数のままなので、
+    自重42回と加重42回を区別できるのはこの表記だけ。"""
     if not sets:
         return None, None
     weights = [wv for wv, _ in sets]
     if bw:
         reps = [rv for _, rv in sets]
-        return ",".join(str(r) for r in reps) + "回", float(sum(reps))
+        body = ",".join(str(r) for r in reps) + "回"
+        prefix = f"+{added:g}lb " if added else ""
+        return prefix + body, float(sum(reps))
     if len(set(weights)) <= 1:
         wv = weights[0]
         reps_str = ",".join(str(rv) for _, rv in sets)
@@ -439,6 +465,52 @@ def parse_set_count(goal: str, default: int = 3) -> int:
     if m:
         return min(max(int(m.group(1)), 1), MAX_SETS)
     return default
+
+
+def reps_exercise_names(df: pd.DataFrame) -> set:
+    """回数で記録する種目の名前一覧。週によって目標の書き方が揺れる（ブルガリアン
+    スクワットが一度だけ『自重or 5lb』だった等）ので、多数決で決める。
+    1週でも該当すれば回数種目、とすると重量種目が誤って除外される。"""
+    votes = {}
+    for ex, gw in zip(df["種目"], df["目標重量"]):
+        if gw:
+            votes.setdefault(ex, []).append(is_reps_goal(gw))
+    return {ex for ex, v in votes.items() if sum(v) / len(v) > 0.5}
+
+
+def growth_stats(df: pd.DataFrame, upto: int = 15):
+    """W1〜upto の成長を集計する。返り値は (重量種目, 回数種目, 全体サマリー)。
+    種目名が同じでも分割が違えば別マシン（ショルダープレスは Push A がダンベル、
+    Push B がマシン）なので、必ず 種目×分割 で集計する。"""
+    d = df[(df["週num"].notna()) & (df["週num"] <= upto)].copy()
+    reps_names = reps_exercise_names(df)
+    per = {}
+    for _, r in d.dropna(subset=["実績重量"]).iterrows():
+        key = (r["種目"], r["分割"])
+        wk = int(r["週num"])
+        per.setdefault(key, {})[wk] = max(per.get(key, {}).get(wk, 0), r["実績重量"])
+    weight_rows, reps_rows = [], []
+    for (ex, sp), wm in per.items():
+        ws = sorted(wm)
+        if len(ws) < 2:
+            continue
+        first, best = wm[ws[0]], max(wm.values())
+        item = {"種目": ex, "分割": sp, "初週": ws[0], "初": first, "ベスト": best,
+                "ベスト週": max(wm, key=wm.get), "増減": best - first,
+                "率": (best / first * 100 - 100) if first else 0.0, "週数": len(ws)}
+        (reps_rows if ex in reps_names else weight_rows).append(item)
+    weight_rows.sort(key=lambda r: -r["増減"])
+    reps_rows.sort(key=lambda r: -r["増減"])
+    graded = d["達成"].notna().sum()
+    summary = {
+        "記録": int(d["実績重量"].notna().sum()),
+        "週数": int(d["週num"].nunique()),
+        "種目数": len(weight_rows) + len(reps_rows),
+        "合計増加": sum(r["増減"] for r in weight_rows),
+        "伸びた": sum(1 for r in weight_rows if r["増減"] > 0),
+        "達成率": (d["達成"] == "✅達成").sum() / graded * 100 if graded else None,
+    }
+    return weight_rows, reps_rows, summary
 
 
 def build_summary(df: pd.DataFrame, week: int) -> str:
@@ -603,7 +675,7 @@ latest_week = int(df["週num"].max()) if df["週num"].notna().any() else None
 
 # タブではなく選択式にする。st.tabs は再実行(「最新に更新」等)のたびに先頭へ戻るが、
 # segmented_control は key で選択が session_state に残るので、更新しても同じ画面のまま。
-VIEWS = ["✍️ 今日の記録", "📊 グラフ", "📤 まとめ＆計画"]
+VIEWS = ["✍️ 今日の記録", "📊 グラフ", "📤 まとめ＆計画", "🏅 W1–W15"]
 # segmented_control は選択中の項目をもう一度タップすると選択解除されて None を返す。
 # その場合は直前の画面を保つ（そうしないと誤タップで「今日の記録」に飛ばされる）。
 if "view_last" not in st.session_state:
@@ -691,6 +763,7 @@ if view == VIEWS[0]:
         for _, row in target.iterrows():
             ex_id = row["page_id"]
             bw = is_bodyweight(row)  # 自重種目なら重量欄を出さない
+            goal_load = parse_added_load(row["目標重量"])  # 加重目標(懸垂等)なら > 0
             n_default = parse_set_count(row["目標"])
             # 初期値を session_state に入れておく（value= と key= の二重指定警告を避ける）
             # 重量・回数は None で初期化＝最初は空欄（0をいちいち消さなくてよい）。
@@ -707,7 +780,19 @@ if view == VIEWS[0]:
             st.markdown(f"**{done_mark} {row['種目']}**　🎯{row['目標'] or '—'}　/　{tag}")
 
             if bw:
-                mc2, mc3 = st.columns([1, 1.2])
+                # 加重できる自重種目（目標に『加重』とある懸垂等）は加重欄も出す。
+                # これが無いと自重42回と加重42回が同じ記録になり、加重目標が
+                # 自重の記録だけで達成扱いになってしまう。
+                if goal_load > 0:
+                    gc1, mc2, mc3 = st.columns([1.2, 1, 1.2])
+                    if f"g_{ex_id}" not in st.session_state:
+                        st.session_state[f"g_{ex_id}"] = None
+                    gc1.number_input(
+                        "加重 (lb)", min_value=0.0, step=2.5, key=f"g_{ex_id}",
+                        help=f"目標は加重{goal_load:g}lb。自重のみなら空欄か0。",
+                    )
+                else:
+                    mc2, mc3 = st.columns([1, 1.2])
             else:
                 mc1, mc2, mc3 = st.columns([1.2, 1, 1.2])
                 mc1.number_input(
@@ -769,7 +854,8 @@ if view == VIEWS[0]:
                 unchanged = (ach == "（未入力）") or (ach == row["達成"])
                 if not sets and unchanged:
                     continue
-                log, top_weight = build_log(sets, bw)
+                log, top_weight = build_log(
+                    sets, bw, added=float(st.session_state.get(f"g_{ex_id}") or 0.0))
                 try:
                     update_record(
                         token, ex_id, weight=top_weight, log=log,
@@ -828,8 +914,12 @@ if view == VIEWS[1]:
         if not is_weight_goal(_r["目標重量"]):
             continue
         _t = parse_target_weight(_r["目標重量"])
-        _b = _lookup(_r["種目"])
+        _load = parse_added_load(_r["目標重量"])
+        # 加重目標なら、その加重で行った記録だけを対象にする
+        _b = (build_best_lookup(filter_by_load(done, _load))(_r["種目"])
+              if _load else _lookup(_r["種目"]))
         if _b is None:
+            _ratios.append(0.0)  # 加重目標に未挑戦。達成率0%として数える
             continue
         _ratio = float(_b) / _t
         _ratios.append(min(_ratio, 1.0))
@@ -890,22 +980,39 @@ if view == VIEWS[1]:
                 continue  # 自重・サーキット系（周/自重）は重量の現在地に出さない
             target = parse_target_weight(r["目標重量"])
             ex = r["種目"]
-            bv = lookup_best(ex)
-            if bv is None:
-                continue  # 実績がまだ無い種目は位置を出せないので非表示
-            lv = lookup_latest(ex)
+            load = parse_added_load(r["目標重量"])
+            if load:
+                # 加重目標（懸垂『加重25lb × 合計32回』等）は、その加重で行った
+                # 記録だけを見る。自重の記録で達成扱いにしない。
+                sub = filter_by_load(done, load)
+                bv = build_best_lookup(sub)(ex)
+                lv = build_best_lookup(sub.sort_values(["週num", "日付"]).groupby(
+                    ["種目", "分割"], as_index=False).tail(1))(ex) if bv is not None else None
+                if bv is None:
+                    rows.append({"種目": f"{ex}（加重{load:g}lb）", "目標": target,
+                                 "lb": False, "ベスト": 0.0, "ベスト率": 0.0,
+                                 "直近": None, "直近率": None, "未挑戦": True})
+                    continue
+                ex = f"{ex}（加重{load:g}lb）"
+            else:
+                bv = lookup_best(ex)
+                if bv is None:
+                    continue  # 実績がまだ無い種目は位置を出せないので非表示
+                lv = lookup_latest(ex)
             rows.append({
                 "種目": ex, "目標": target, "lb": is_lb_unit(r["目標重量"]),
                 "ベスト": bv, "ベスト率": bv / target * 100,
                 "直近": lv, "直近率": (lv / target * 100) if lv is not None else None,
+                "未挑戦": False,
             })
 
     if rows:
         # 達成率の低い順（伸びしろ順）に並べる。上ほど目標に近い。
         gdf = pd.DataFrame(rows).sort_values("ベスト率").reset_index(drop=True)
-        colors = ["#2ca02c" if p >= 100 else "#4c78d8" for p in gdf["ベスト率"]]
-        labels = [f"{b:g} / {t:g}（{p:.0f}%）"
-                  for b, t, p in zip(gdf["ベスト"], gdf["目標"], gdf["ベスト率"])]
+        colors = ["#c9ccd1" if u else ("#2ca02c" if p >= 100 else "#4c78d8")
+                  for p, u in zip(gdf["ベスト率"], gdf["未挑戦"])]
+        labels = [("その加重では未記録" if u else f"{b:g} / {t:g}（{p:.0f}%）")
+                  for b, t, p, u in zip(gdf["ベスト"], gdf["目標"], gdf["ベスト率"], gdf["未挑戦"])]
         # ホバー用に 直近 と kg 換算を渡す（棒はベスト基準、直近はタップで確認）
         cd = [[f"{b:g}", (f"{lv:g}" if lv is not None else "—"), f"{t:g}",
                (f"ベスト {b * LB_TO_KG:.1f}kg / 目標 {t * LB_TO_KG:.1f}kg" if islb
@@ -974,9 +1081,9 @@ if view == VIEWS[1]:
             )
             pb.columns = ["種目", "最大実績重量"]
             # 記録は lb だが感覚を掴みやすいよう kg も併記（自重・回数系は換算しない）
-            # 種目が回数系かは、その種目のどれか1つでも回数目標があれば回数系とみなす。
-            # （取得順に依存する dict(zip(...)) だと kg 列が出たり出なかったりする）
-            reps_names = {ex for ex, gw in zip(df["種目"], df["目標重量"]) if is_reps_goal(gw)}
+            # 回数系の判定は多数決（取得順に依存する dict(zip(...)) だと
+            # kg 列が出たり出なかったりする）
+            reps_names = reps_exercise_names(df)
             goal_txt = {ex: gw for ex, gw in zip(df["種目"], df["目標重量"])
                         if gw and ex not in reps_names}
             pb["kg"] = [
@@ -1126,3 +1233,88 @@ if view == VIEWS[2]:
                 st.error("一部失敗:\n" + "\n".join(errors[:5]))
     elif goal_pasted.strip():
         st.info("解析できる行がありませんでした。`種目 | 目標重量` の形式で貼ってください。")
+
+# =====================================================================
+# 🏅 W1–W15 — 目標を切り替える前の成長記録（節目のまとめ）
+# =====================================================================
+if view == VIEWS[3]:
+    UPTO = 15
+    st.subheader(f"🏅 W1–W{UPTO} の成長記録")
+    st.caption(
+        f"W{UPTO + 1} から目標が切り替わったため、ここまでを一区切りとしてまとめたもの。"
+        "重量は lb（kg併記）、懸垂などは回数。同じ種目名でも分割ごとに別マシンとして集計。"
+    )
+    wrows, rrows, summ = growth_stats(df, UPTO)
+    if not wrows:
+        st.info("まだ集計できる実績がありません。")
+    else:
+        h1, h2 = st.columns(2)
+        h1.metric("積み上げた重量の合計", f"+{summ['合計増加']:g} lb",
+                  help=f"= +{summ['合計増加'] * LB_TO_KG:.0f} kg")
+        h2.metric("ベストを更新した種目", f"{summ['伸びた']} / {len(wrows)}")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("記録セット数", f"{summ['記録']}")
+        s2.metric("週数", f"{summ['週数']}")
+        s3.metric("種目数", f"{summ['種目数']}")
+        s4.metric("達成率", f"{summ['達成率']:.0f}%" if summ["達成率"] is not None else "—")
+
+        st.divider()
+        st.markdown("#### 主要リフトの伸び（増加量トップ6）")
+        cols = st.columns(3)
+        for i, r in enumerate(wrows[:6]):
+            with cols[i % 3]:
+                st.metric(
+                    f"{r['種目']}（{r['分割']}）",
+                    f"{r['ベスト']:g} lb", f"+{r['増減']:g} lb（{r['率']:+.0f}%）",
+                    help=f"W{r['初週']} {r['初']:g}lb → W{r['ベスト週']} {r['ベスト']:g}lb"
+                         f"（{r['初'] * LB_TO_KG:.0f} → {r['ベスト'] * LB_TO_KG:.0f} kg）",
+                )
+
+        st.divider()
+        st.markdown("#### 伸び率トップ15")
+        top = sorted(wrows, key=lambda r: -r["率"])[:15]
+        tdf = pd.DataFrame([{
+            "種目": f"{r['種目']}（{r['分割']}）", "伸び率": r["率"],
+            "初回": r["初"], "ベスト": r["ベスト"],
+        } for r in top]).sort_values("伸び率")
+        figg = go.Figure(go.Bar(
+            y=tdf["種目"], x=tdf["伸び率"], orientation="h", marker_color="#4c78d8",
+            text=[f"{v:+.0f}%" for v in tdf["伸び率"]], textposition="outside",
+            cliponaxis=False, customdata=tdf[["初回", "ベスト"]],
+            hovertemplate="初回 %{customdata[0]} → ベスト %{customdata[1]} lb<extra>%{y}</extra>",
+        ))
+        figg.update_layout(height=max(320, 30 * len(tdf) + 90), xaxis_title="伸び率 (%)",
+                           margin=dict(l=6, r=40, t=20, b=10), yaxis=dict(automargin=True))
+        st.plotly_chart(figg, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### 重量種目の記録")
+        st.caption("増加量の大きい順。kg は lb×0.4536 の換算。")
+        st.dataframe(pd.DataFrame([{
+            "種目": r["種目"], "分割": r["分割"],
+            "初回(lb)": r["初"], "ベスト(lb)": r["ベスト"],
+            "kg(初→ベスト)": f"{r['初'] * LB_TO_KG:.1f} → {r['ベスト'] * LB_TO_KG:.1f}",
+            "増減": r["増減"], "伸び率(%)": round(r["率"]), "記録週": r["週数"],
+            "ベスト週": f"W{r['ベスト週']}",
+        } for r in wrows]), use_container_width=True, hide_index=True, height=420)
+
+        if rrows:
+            st.markdown("#### 回数で記録する種目")
+            st.caption("自重・サーキット種目。重量ではなく回数（懸垂は合計回数）で記録。")
+            st.dataframe(pd.DataFrame([{
+                "種目": r["種目"], "分割": r["分割"], "初回": r["初"],
+                "ベスト": r["ベスト"], "増減": r["増減"], "記録週": r["週数"],
+            } for r in rrows]), use_container_width=True, hide_index=True)
+
+        bw = df.dropna(subset=["体重", "日付"])
+        if not bw.empty:
+            st.divider()
+            st.markdown("#### 体重")
+            bwd = bw.groupby("日付", as_index=False)["体重"].max().sort_values("日付")
+            st.metric("体重", f"{bwd['体重'].iloc[-1]:.1f} kg",
+                      f"{bwd['体重'].iloc[-1] - 56.0:+.1f} kg（W1の56kgから）")
+            figw = px.line(bwd, x="日付", y="体重", markers=True,
+                           labels={"日付": "日付", "体重": "体重 (kg)"})
+            figw.update_layout(height=300, margin=dict(l=6, r=6, t=20, b=10))
+            st.plotly_chart(figw, use_container_width=True)
+            st.caption("起点の 56.0kg（W1・2026/4/21）は記録がないため申告値。実測は 6/20 の 57.5kg から。")
