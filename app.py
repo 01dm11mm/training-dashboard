@@ -28,7 +28,10 @@ from streamlit_local_storage import LocalStorage
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "dc49803fa43a48868e54824072e2ffb1")
 NOTION_VERSION = "2022-06-28"
 API = "https://api.notion.com/v1"
-KEY_LIFTS = ["レッグプレス", "チェストプレス(15°)", "シーテッドロー", "ラットプルダウン(ワイド)"]
+# 推移グラフの初期選択。現行メニューにある名前にすること
+# （旧名 'チェストプレス(15°)' は W8 までで、選んでも途中で途切れる）
+KEY_LIFTS = ["レッグプレス", "チェストプレス(LOW angle)", "シーテッドロー",
+             "ラットプルダウン(ワイド)"]
 SPLITS = ["Push A", "Pull A", "Legs A", "Push B", "Pull B", "Legs B"]
 ACHIEVE_OPTIONS = ["✅達成", "△一部", "❌未達", "－スキップ"]
 PARTS_OPTIONS = ["胸", "背中", "肩", "脚", "腕", "腹", "体幹"]
@@ -1115,13 +1118,25 @@ if view == VIEWS[1]:
     if done.empty:
         st.info("まだ実績がありません。「今日の記録」から入力してください。")
     else:
-        all_ex = sorted(done["種目"].unique())
+        # 過去にやめた種目・改名前の名前が選択肢に残り続けるため、既定では
+        # 今のメニュー(最新週)にある種目だけに絞る。外せば全期間の種目が出る。
+        current_ex = set(df[df["週num"] == latest_week]["種目"]) if latest_week else set()
+        recorded = sorted(done["種目"].unique())
+        only_now = st.checkbox(
+            "今のメニューの種目だけ", value=True,
+            help=f"外すと、やめた種目や改名前の名前も選べます（全{len(recorded)}種目）。",
+        )
+        all_ex = [e for e in recorded if e in current_ex] if (only_now and current_ex) else recorded
         defaults = [e for e in KEY_LIFTS if e in all_ex] or all_ex[:3]
         left, right = st.columns([3, 1])
         with left:
             selected = st.multiselect("種目を選択", all_ex, default=defaults)
         with right:
             x_axis = st.radio("横軸", ["週", "日付"], horizontal=True)
+        if only_now and current_ex:
+            dropped = len(recorded) - len(all_ex)
+            if dropped:
+                st.caption(f"今のメニューに無い過去の種目 {dropped} 件を隠しています。")
 
         if selected:
             sub = done[done["種目"].isin(selected)].copy()
@@ -1172,10 +1187,19 @@ if view == VIEWS[1]:
         bwdf = df.dropna(subset=["体重", "日付"]).copy()
         # 1日1値（同じ日に複数行に体重が付いていても代表値1つにまとめる）
         bwdf = bwdf.groupby("日付", as_index=False)["体重"].max().sort_values("日付")
+        bw_first, bw_last = bwdf["体重"].iloc[0], bwdf["体重"].iloc[-1]
+        bc1, bc2 = st.columns([1, 2])
+        bc1.metric("現在の体重", f"{bw_last:.1f} kg",
+                   f"{bw_last - bw_first:+.1f} kg",
+                   help=f"開始時 {bw_first:.1f}kg（{bwdf['日付'].iloc[0]:%Y/%-m/%-d}）からの増減")
         figw = px.line(bwdf, x="日付", y="体重", markers=True,
                        labels={"日付": "日付", "体重": "体重 (kg)"})
         figw.update_layout(height=320)
         st.plotly_chart(figw, use_container_width=True)
+        st.caption(
+            f"開始時 {bw_first:.1f}kg → 現在 {bw_last:.1f}kg（{bw_last - bw_first:+.1f}kg）。"
+            "4月・5月は当時アプリで計測しておらず、後から入力した申告値です。"
+        )
 
     st.divider()
     if latest_week is not None:
@@ -1350,10 +1374,14 @@ if view == VIEWS[3]:
             st.divider()
             st.markdown("#### 体重")
             bwd = bw.groupby("日付", as_index=False)["体重"].max().sort_values("日付")
-            st.metric("体重", f"{bwd['体重'].iloc[-1]:.1f} kg",
-                      f"{bwd['体重'].iloc[-1] - 56.0:+.1f} kg（W1の56kgから）")
+            bw0, bw1 = bwd["体重"].iloc[0], bwd["体重"].iloc[-1]
+            st.metric("体重", f"{bw1:.1f} kg",
+                      f"{bw1 - bw0:+.1f} kg（開始時 {bw0:.0f}kg から）")
             figw = px.line(bwd, x="日付", y="体重", markers=True,
                            labels={"日付": "日付", "体重": "体重 (kg)"})
             figw.update_layout(height=300, margin=dict(l=6, r=6, t=20, b=10))
             st.plotly_chart(figw, use_container_width=True)
-            st.caption("起点の 56.0kg（W1・2026/4/21）は記録がないため申告値。実測は 6/20 の 57.5kg から。")
+            st.caption(
+                "4月(開始時)56kg・5月57kg は当時アプリで計測しておらず、後から入力した申告値。"
+                "アプリでの実測は 6/20 の 57.5kg から。"
+            )
